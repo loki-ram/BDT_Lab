@@ -70,3 +70,9 @@ htmlcov/
 # Temporary files
 *.tmp
 *.temp
+
+#parquet files
+*.parquet/
+*_model/
+
+output/

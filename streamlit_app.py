@@ -380,6 +380,16 @@ if filtered.empty:
     st.warning("No data matches the selected filters. Please adjust your selection.")
     st.stop()
 
+# Smart sampling for visualizations - keep aggregations accurate but sample for charts
+# This prevents memory overload with 14M rows
+CHART_SAMPLE_SIZE = 100000
+if len(filtered) > CHART_SAMPLE_SIZE:
+    filtered_chart = filtered.sample(n=CHART_SAMPLE_SIZE, random_state=42)
+    debug_log(f"Sampled {CHART_SAMPLE_SIZE} rows from {len(filtered)} for visualization")
+else:
+    filtered_chart = filtered
+    debug_log(f"Using all {len(filtered)} rows for visualization")
+
 # ---------- HEADER ----------
 st.markdown('<div class="main-title">🛒 QuickCommerce Platform Recommender</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">Pick your products, set your priorities — we\'ll rank the best platform for you</div>', unsafe_allow_html=True)
@@ -510,7 +520,8 @@ with col_right:
 st.markdown("---")
 st.markdown("### 🔍 Category-Level Platform Comparison")
 
-cat_platform = filtered.groupby(["category", "platform"]).agg(
+# Use sampled data for faster chart rendering
+cat_platform = filtered_chart.groupby(["category", "platform"]).agg(
     avg_price=("effective_price", "mean"),
     avg_delivery=("delivery_minutes", "mean"),
     avg_rating=("rating", "mean"),
@@ -544,7 +555,8 @@ with col_b:
 st.markdown("---")
 st.markdown("### 📋 Product-Level Platform Metrics")
 
-product_plat = filtered.groupby(["product_name", "category", "platform"]).agg(
+# Use sampled data for faster rendering
+product_plat = filtered_chart.groupby(["product_name", "category", "platform"]).agg(
     avg_price=("effective_price", "mean"),
     avg_delivery=("delivery_minutes", "mean"),
     avg_rating=("rating", "mean"),

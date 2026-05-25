@@ -616,6 +616,11 @@ if demand_df is not None:
     if selected_products:
         demand_filtered = demand_filtered[demand_filtered["product_name"].isin(selected_products)]
 
+    # Sample demand data to prevent memory overload (14M → 50K rows)
+    if len(demand_filtered) > 50000:
+        demand_filtered = demand_filtered.sample(n=50000, random_state=42)
+        debug_log(f"Sampled demand data to 50K rows for visualization")
+
     # Dynamic Weighting: Adjust predictions based on user's slider preferences (via platform scores)
     platform_scores_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
     demand_filtered["preference_multiplier"] = demand_filtered["platform"].map(platform_scores_map).fillna(0.5)
@@ -730,6 +735,11 @@ if trend_df is not None:
 
     if selected_products:
         trend_filtered = trend_filtered[trend_filtered["product_name"].isin(selected_products)]
+
+    # Sample trend data to prevent memory overload (14M → 50K rows)
+    if len(trend_filtered) > 50000:
+        trend_filtered = trend_filtered.sample(n=50000, random_state=42)
+        debug_log(f"Sampled trend data to 50K rows for visualization")
 
     # Dynamic Weighting: Adjust trend strength based on slider preferences
     platform_scores_map = dict(zip(scores["platform"], scores["overall_score"] / 100))

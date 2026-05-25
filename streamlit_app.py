@@ -17,10 +17,11 @@ import glob
 import sys
 import s3fs
 
+# Set S3 region and configuration BEFORE any S3 operations
 # Set S3 timeouts and region BEFORE any S3 operations
-# These are crucial for avoiding hangs on Streamlit Cloud with large files (740MB download)
+# These are crucial for avoiding hangs on Streamlit Cloud with large files
 os.environ["S3_CONNECT_TIMEOUT"] = "60"
-os.environ["S3_READ_TIMEOUT"] = "600"  # 10 minutes for large file downloads
+os.environ["S3_READ_TIMEOUT"] = "600"  # 5 minutes for 740MB file
 os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
 
 # ═════════════════════════════════════════════
@@ -169,25 +170,33 @@ div[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f0f1a 0%, #
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_unified():
-    """Load unified data from S3 with timeout and retry logic"""
+    """Load unified data from S3 with selective columns to minimize memory"""
     try:
         debug_log(f"Loading unified.parquet from {UNIFIED_PARQUET}...")
         debug_log(f"AWS_ACCESS_KEY_ID present: {'AWS_ACCESS_KEY_ID' in os.environ}")
         debug_log(f"AWS_SECRET_ACCESS_KEY present: {'AWS_SECRET_ACCESS_KEY' in os.environ}")
         
-        with st.spinner("📥 Loading platform data from S3 (740MB)... this may take 2-3 minutes"):
-            # Use pyarrow with s3 filesystem (environment variables handle timeouts)
+        # Only load columns we actually use - reduces 740MB → ~150MB
+        columns_needed = [
+            "platform", "category", "product_name", 
+            "delivery_minutes", "effective_price", "rating",
+            "units_ordered", "stock_remaining", "in_stock", "snapshot_time"
+        ]
+        
+        with st.spinner("📥 Loading platform data from S3... this may take 1-2 minutes"):
+            # Use pyarrow with s3 filesystem and selective columns
             df = pd.read_parquet(
                 UNIFIED_PARQUET, 
                 engine='pyarrow',
+                columns=columns_needed,
                 storage_options={"anon": False}
             )
             df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
-        debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols")
+        debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols (memory optimized)")
         return df
     except TimeoutError as e:
         debug_log(f"⏱️  S3 timeout: {e}")
-        st.error(f"⏱️  S3 Connection Timeout: Data load took too long. Please try refreshing in 2-3 minutes.\n\nError: {e}")
+        st.error(f"⏱️  S3 Connection Timeout: Data load took too long. Please try refreshing in 1-2 minutes.\n\nError: {e}")
         return None
     except Exception as e:
         debug_log(f"❌ Error loading unified: {type(e).__name__}: {str(e)[:200]}")
@@ -196,15 +205,19 @@ def load_unified():
 
 @st.cache_data(ttl=3600)
 def load_demand_forecasts():
-    """Load demand forecasts with timeout"""
+    """Load demand forecasts with selective columns"""
     try:
         debug_log("Loading demand_forecasts.parquet...")
+        # Only load columns we use
+        columns_needed = ["platform", "category", "product_name", "predicted_demand", "units_ordered"]
+        
         df = pd.read_parquet(
             DEMAND_FORECASTS, 
             engine='pyarrow',
+            columns=columns_needed,
             storage_options={"anon": False}
         )
-        debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows")
+        debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows (memory optimized)")
         return df
     except Exception as e:
         debug_log(f"⚠️  Could not load demand forecasts: {type(e).__name__}")
@@ -212,16 +225,21 @@ def load_demand_forecasts():
 
 @st.cache_data(ttl=3600)
 def load_trend_labels():
-    """Load trend labels with timeout"""
+    """Load trend labels with selective columns"""
     try:
         debug_log("Loading trend_labels.parquet...")
+        # Only load columns we use
+        columns_needed = ["platform", "category", "product_name", "date", "daily_demand", 
+                          "rolling_avg_7d", "trend_label", "predicted_label_idx"]
+        
         df = pd.read_parquet(
             TREND_LABELS, 
             engine='pyarrow',
+            columns=columns_needed,
             storage_options={"anon": False}
         )
         df["date"] = pd.to_datetime(df["date"])
-        debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows")
+        debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows (memory optimized)")
         return df
     except Exception as e:
         debug_log(f"⚠️  Could not load trend labels: {type(e).__name__}")

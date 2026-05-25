@@ -17,9 +17,8 @@ import glob
 import sys
 import s3fs
 
-# Set S3 timeout BEFORE any S3 operations
-os.environ["S3_CONNECT_TIMEOUT"] = "60"
-os.environ["S3_READ_TIMEOUT"] = "120"
+# Set S3 region and configuration BEFORE any S3 operations
+os.environ[\"AWS_DEFAULT_REGION\"] = \"eu-north-1\"
 
 # ═════════════════════════════════════════════
 # DEBUG MODE - Show startup information
@@ -174,16 +173,11 @@ def load_unified():
         debug_log(f"AWS_SECRET_ACCESS_KEY present: {'AWS_SECRET_ACCESS_KEY' in os.environ}")
         
         with st.spinner("📥 Loading platform data from S3 (740MB)... this may take 2-3 minutes"):
-            # Use pyarrow with explicit timeout settings
+            # Use pyarrow with s3 filesystem (environment variables handle timeouts)
             df = pd.read_parquet(
                 UNIFIED_PARQUET, 
                 engine='pyarrow',
-                storage_options={
-                    "anon": False,
-                    "requester_pays": False,
-                    "connect_timeout": 60,
-                    "read_timeout": 300,
-                }
+                storage_options={"anon": False}
             )
             df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
         debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols")
@@ -205,11 +199,7 @@ def load_demand_forecasts():
         df = pd.read_parquet(
             DEMAND_FORECASTS, 
             engine='pyarrow',
-            storage_options={
-                "anon": False,
-                "connect_timeout": 60,
-                "read_timeout": 180
-            }
+            storage_options={"anon": False}
         )
         debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows")
         return df
@@ -225,11 +215,7 @@ def load_trend_labels():
         df = pd.read_parquet(
             TREND_LABELS, 
             engine='pyarrow',
-            storage_options={
-                "anon": False,
-                "connect_timeout": 60,
-                "read_timeout": 180
-            }
+            storage_options={"anon": False}
         )
         df["date"] = pd.to_datetime(df["date"])
         debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows")

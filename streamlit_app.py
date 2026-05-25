@@ -14,14 +14,34 @@ from datetime import datetime
 import os
 import json
 import glob
+import sys
+
+# ═════════════════════════════════════════════
+# DEBUG MODE - Show startup information
+# ═════════════════════════════════════════════
+DEBUG = True
+
+def debug_log(msg):
+    """Print debug messages to console and app"""
+    if DEBUG:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{timestamp}] DEBUG: {msg}", file=sys.stderr)
+
+debug_log("🚀 App initialization started")
 
 # ─────────────────────────────────────────────
 # ENVIRONMENT & PATHS
 # ─────────────────────────────────────────────
 IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
+debug_log(f"IS_DATABRICKS: {IS_DATABRICKS}")
 
 # Safely detect Streamlit Cloud (check env var only at module level)
 IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None
+debug_log(f"IS_STREAMLIT_CLOUD: {IS_STREAMLIT_CLOUD}")
+
+# Check AWS credentials
+HAS_AWS_KEYS = "AWS_ACCESS_KEY_ID" in os.environ or "AWS_SECRET_ACCESS_KEY" in os.environ
+debug_log(f"AWS credentials in environment: {HAS_AWS_KEYS}")
 
 # Try to load AWS credentials from Streamlit Cloud secrets (safe to call after st config)
 if IS_STREAMLIT_CLOUD:
@@ -29,8 +49,11 @@ if IS_STREAMLIT_CLOUD:
         os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
         os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
         os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
-    except Exception:
-        pass
+        debug_log("✅ AWS credentials loaded from Streamlit secrets")
+    except KeyError as e:
+        debug_log(f"⚠️  AWS credentials not in secrets: {e}")
+    except Exception as e:
+        debug_log(f"⚠️  Error loading secrets: {e}")
 
 # S3 paths (works locally if AWS_ACCESS_KEY_ID is set in env or .streamlit/secrets.toml)
 S3_BASE = "s3://qcommerce-bdt-cct/parquets"
@@ -55,6 +78,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+debug_log("✅ Streamlit page config set")
 
 # ─────────────────────────────────────────────
 # CUSTOM CSS
@@ -134,28 +159,54 @@ div[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f0f1a 0%, #
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_unified():
+    """Load unified data from S3 with timeout handling"""
     try:
-        df = pd.read_parquet(UNIFIED_PARQUET)
-        df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
+        debug_log(f"Loading unified.parquet from {UNIFIED_PARQUET}...")
+        with st.spinner("📥 Loading platform data from S3 (740MB)... this may take 1-2 minutes"):
+            df = pd.read_parquet(UNIFIED_PARQUET, engine='pyarrow')
+            df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
+        debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols")
         return df
+    except TimeoutError as e:
+        debug_log(f"⏱️  S3 timeout: {e}")
+        st.error(f"⏱️  S3 Connection Timeout: Data load took too long. Try refreshing in 1 minute.\n\nError: {e}")
+        return None
+    except FileNotFoundError as e:
+        debug_log(f"📁 File not found: {e}")
+        st.error(f"📁 Data file not found in S3: {UNIFIED_PARQUET}\n\nError: {e}")
+        return None
+    except PermissionError as e:
+        debug_log(f"🔐 Permission denied: {e}")
+        st.error(f"🔐 AWS Permission Denied. Check credentials in Streamlit Secrets.\n\nError: {e}")
+        return None
     except Exception as e:
-        st.error(f"❌ Could not load unified data: {e}")
+        debug_log(f"❌ Unexpected error loading unified: {type(e).__name__}: {e}")
+        st.error(f"❌ Could not load unified data:\n\n**Error Type:** {type(e).__name__}\n**Message:** {e}")
         return None
 
 @st.cache_data(ttl=3600)
 def load_demand_forecasts():
+    """Load demand forecasts with error handling"""
     try:
-        return pd.read_parquet(DEMAND_FORECASTS)
+        debug_log("Loading demand_forecasts.parquet...")
+        df = pd.read_parquet(DEMAND_FORECASTS, engine='pyarrow')
+        debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows")
+        return df
     except Exception as e:
+        debug_log(f"⚠️  Could not load demand forecasts: {type(e).__name__}: {e}")
         return None
 
 @st.cache_data(ttl=3600)
 def load_trend_labels():
+    """Load trend labels with error handling"""
     try:
-        df = pd.read_parquet(TREND_LABELS)
+        debug_log("Loading trend_labels.parquet...")
+        df = pd.read_parquet(TREND_LABELS, engine='pyarrow')
         df["date"] = pd.to_datetime(df["date"])
+        debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows")
         return df
     except Exception as e:
+        debug_log(f"⚠️  Could not load trend labels: {type(e).__name__}: {e}")
         return None
 
 # ─────────────────────────────────────────────
@@ -208,9 +259,33 @@ def compute_platform_scores(df, w_delivery, w_price, w_quality):
 # ─────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────
-unified_df = load_unified()
+debug_log("Attempting to load main dataset...")
+
+with st.spinner("⏳ Initializing app and loading data from S3..."):
+    unified_df = load_unified()
 
 if unified_df is None:
+    st.markdown("""
+    <div style="background: #fee2e2; border: 1px solid #fca5a5; border-radius: 8px; padding: 16px; margin: 16px 0;">
+        <h3 style="color: #991b1b; margin-top: 0;">⚠️ Data Loading Failed</h3>
+        <p><strong>Possible causes:</strong></p>
+        <ul>
+            <li>❌ AWS credentials not set in Streamlit Secrets</li>
+            <li>❌ S3 bucket is not accessible</li>
+            <li>❌ Network timeout (S3 is slow)</li>
+            <li>❌ IAM permissions missing</li>
+        </ul>
+        <p><strong>Next steps:</strong></p>
+        <ol>
+            <li>Go to Settings → Secrets</li>
+            <li>Add your AWS credentials:</li>
+            <code>AWS_ACCESS_KEY_ID = "your-key"<br>AWS_SECRET_ACCESS_KEY = "your-secret"</code>
+            <li>Click Save and wait 1-2 minutes for app to redeploy</li>
+            <li>Refresh this page</li>
+        </ol>
+    </div>
+    """, unsafe_allow_html=True)
+    debug_log("⛔ App stopped: Could not load unified data")
     st.stop()
 
 # ---------- SIDEBAR ----------
@@ -715,3 +790,6 @@ st.markdown(f"""
     &bull; Models: GBT Demand Forecaster + RF Trend Classifier
 </div>
 """, unsafe_allow_html=True)
+
+# Debug: App loaded successfully
+debug_log("✅ App rendered successfully!")

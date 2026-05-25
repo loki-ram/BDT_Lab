@@ -23,25 +23,25 @@ IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
 # Safely detect Streamlit Cloud (check env var only at module level)
 IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None
 
+# Try to load AWS credentials from Streamlit Cloud secrets (safe to call after st config)
 if IS_STREAMLIT_CLOUD:
-    # Read Secrets internally provided to Streamlit Cloud
     try:
         os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
         os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
         os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
     except Exception:
         pass
-    
-    # User's specified S3 path containing the uploaded parquets
-    S3_BASE = "s3://qcommerce-bdt-cct/parquets"
-    BASE_DIR = S3_BASE  # Provides a dummy BASE_DIR for non-existent models to safely fail
-    UNIFIED_PARQUET = f"{S3_BASE}/unified.parquet"
-    PRICE_ANALYTICS = f"{S3_BASE}/price_analytics.parquet"
-    DELIVERY_ANALYTICS = f"{S3_BASE}/delivery_analytics.parquet"
-    REVENUE_ANALYTICS = f"{S3_BASE}/revenue_analytics.parquet"
-    STOCK_ANALYTICS = f"{S3_BASE}/stock_analytics.parquet"
-    DEMAND_FORECASTS = f"{S3_BASE}/demand_forecasts.parquet"
-    TREND_LABELS = f"{S3_BASE}/trend_labels.parquet"
+
+# S3 paths (works locally if AWS_ACCESS_KEY_ID is set in env or .streamlit/secrets.toml)
+S3_BASE = "s3://qcommerce-bdt-cct/parquets"
+BASE_DIR = S3_BASE
+UNIFIED_PARQUET = f"{S3_BASE}/unified.parquet"
+PRICE_ANALYTICS = f"{S3_BASE}/price_analytics.parquet"
+DELIVERY_ANALYTICS = f"{S3_BASE}/delivery_analytics.parquet"
+REVENUE_ANALYTICS = f"{S3_BASE}/revenue_analytics.parquet"
+STOCK_ANALYTICS = f"{S3_BASE}/stock_analytics.parquet"
+DEMAND_FORECASTS = f"{S3_BASE}/demand_forecasts.parquet"
+TREND_LABELS = f"{S3_BASE}/trend_labels.parquet"
 
 PLATFORM_COLORS = {"blinkit": "#F8C100", "zepto": "#7B2FF7", "swiggy": "#FC8019"}
 PLATFORM_ICONS = {"blinkit": "🟡", "zepto": "🟣", "swiggy": "🟠"}

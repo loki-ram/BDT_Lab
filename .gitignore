@@ -76,3 +76,5 @@ htmlcov/
 *_model/
 
 output/
+
+.streamlit/secrets.toml

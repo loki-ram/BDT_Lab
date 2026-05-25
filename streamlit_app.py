@@ -19,7 +19,10 @@ import glob
 # ENVIRONMENT & PATHS
 # ─────────────────────────────────────────────
 IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
-IS_STREAMLIT_CLOUD = "STREAMLIT_RUNTIME_VERSION" in os.environ
+
+# A more reliable way to detect Streamlit Cloud: check for the presence of secrets
+# OR if STREAMLIT_RUNTIME_VERSION exists, OR just default to True if not local/Databricks
+IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None or "AWS_ACCESS_KEY_ID" in st.secrets
 
 if IS_STREAMLIT_CLOUD:
     # Read Secrets internally provided to Streamlit Cloud
@@ -40,7 +43,7 @@ if IS_STREAMLIT_CLOUD:
     STOCK_ANALYTICS = f"{S3_BASE}/stock_analytics.parquet"
     DEMAND_FORECASTS = f"{S3_BASE}/demand_forecasts.parquet"
     TREND_LABELS = f"{S3_BASE}/trend_labels.parquet"
-elif IS_DATABRICKS:
+"""elif IS_DATABRICKS:
     # Databricks Volumes paths (Unity Catalog)
     PROCESSED_DIR = "/Volumes/workspace/default/data/processed"
     CURATED_DIR = "/Volumes/workspace/default/data/curated"
@@ -62,7 +65,7 @@ else:
     REVENUE_ANALYTICS = os.path.join(BASE_DIR, "output", "processed", "revenue_analytics.parquet")
     STOCK_ANALYTICS = os.path.join(BASE_DIR, "output", "processed", "stock_analytics.parquet")
     DEMAND_FORECASTS = os.path.join(BASE_DIR, "output", "curated", "demand_forecasts.parquet")
-    TREND_LABELS = os.path.join(BASE_DIR, "output", "curated", "trend_labels.parquet")
+    TREND_LABELS = os.path.join(BASE_DIR, "output", "curated", "trend_labels.parquet")"""
 
 PLATFORM_COLORS = {"blinkit": "#F8C100", "zepto": "#7B2FF7", "swiggy": "#FC8019"}
 PLATFORM_ICONS = {"blinkit": "🟡", "zepto": "🟣", "swiggy": "🟠"}

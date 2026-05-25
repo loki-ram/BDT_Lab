@@ -15,6 +15,11 @@ import os
 import json
 import glob
 import sys
+import s3fs
+
+# Set S3 timeout BEFORE any S3 operations
+os.environ["S3_CONNECT_TIMEOUT"] = "60"
+os.environ["S3_READ_TIMEOUT"] = "120"
 
 # ═════════════════════════════════════════════
 # DEBUG MODE - Show startup information
@@ -35,25 +40,28 @@ debug_log("🚀 App initialization started")
 IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
 debug_log(f"IS_DATABRICKS: {IS_DATABRICKS}")
 
-# Safely detect Streamlit Cloud (check env var only at module level)
-IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None
+# Better Streamlit Cloud detection - also check for specific cloud markers
+STREAMLIT_RUNTIME = os.environ.get("STREAMLIT_RUNTIME_VERSION")
+IS_STREAMLIT_CLOUD = STREAMLIT_RUNTIME is not None or os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
 debug_log(f"IS_STREAMLIT_CLOUD: {IS_STREAMLIT_CLOUD}")
+debug_log(f"STREAMLIT_RUNTIME_VERSION: {STREAMLIT_RUNTIME}")
 
-# Check AWS credentials
+# Check AWS credentials - try multiple sources
 HAS_AWS_KEYS = "AWS_ACCESS_KEY_ID" in os.environ or "AWS_SECRET_ACCESS_KEY" in os.environ
 debug_log(f"AWS credentials in environment: {HAS_AWS_KEYS}")
 
-# Try to load AWS credentials from Streamlit Cloud secrets (safe to call after st config)
-if IS_STREAMLIT_CLOUD:
-    try:
-        os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
-        os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
+# Always try to load from secrets (works on Streamlit Cloud + local)
+try:
+    if not HAS_AWS_KEYS:
+        debug_log("Attempting to load AWS credentials from st.secrets...")
+        os.environ["AWS_ACCESS_KEY_ID"] = st.secrets.get("AWS_ACCESS_KEY_ID", "")
+        os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets.get("AWS_SECRET_ACCESS_KEY", "")
         os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
-        debug_log("✅ AWS credentials loaded from Streamlit secrets")
-    except KeyError as e:
-        debug_log(f"⚠️  AWS credentials not in secrets: {e}")
-    except Exception as e:
-        debug_log(f"⚠️  Error loading secrets: {e}")
+        debug_log("✅ AWS credentials loaded from secrets")
+    else:
+        debug_log("✅ AWS credentials already in environment")
+except Exception as e:
+    debug_log(f"⚠️  Could not load secrets: {e}")
 
 # S3 paths (works locally if AWS_ACCESS_KEY_ID is set in env or .streamlit/secrets.toml)
 S3_BASE = "s3://qcommerce-bdt-cct/parquets"
@@ -159,54 +167,75 @@ div[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f0f1a 0%, #
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_unified():
-    """Load unified data from S3 with timeout handling"""
+    """Load unified data from S3 with timeout and retry logic"""
     try:
         debug_log(f"Loading unified.parquet from {UNIFIED_PARQUET}...")
-        with st.spinner("📥 Loading platform data from S3 (740MB)... this may take 1-2 minutes"):
-            df = pd.read_parquet(UNIFIED_PARQUET, engine='pyarrow')
+        debug_log(f"AWS_ACCESS_KEY_ID present: {'AWS_ACCESS_KEY_ID' in os.environ}")
+        debug_log(f"AWS_SECRET_ACCESS_KEY present: {'AWS_SECRET_ACCESS_KEY' in os.environ}")
+        
+        with st.spinner("📥 Loading platform data from S3 (740MB)... this may take 2-3 minutes"):
+            # Use pyarrow with explicit timeout settings
+            df = pd.read_parquet(
+                UNIFIED_PARQUET, 
+                engine='pyarrow',
+                storage_options={
+                    "anon": False,
+                    "requester_pays": False,
+                    "connect_timeout": 60,
+                    "read_timeout": 300,
+                }
+            )
             df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
         debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols")
         return df
     except TimeoutError as e:
         debug_log(f"⏱️  S3 timeout: {e}")
-        st.error(f"⏱️  S3 Connection Timeout: Data load took too long. Try refreshing in 1 minute.\n\nError: {e}")
-        return None
-    except FileNotFoundError as e:
-        debug_log(f"📁 File not found: {e}")
-        st.error(f"📁 Data file not found in S3: {UNIFIED_PARQUET}\n\nError: {e}")
-        return None
-    except PermissionError as e:
-        debug_log(f"🔐 Permission denied: {e}")
-        st.error(f"🔐 AWS Permission Denied. Check credentials in Streamlit Secrets.\n\nError: {e}")
+        st.error(f"⏱️  S3 Connection Timeout: Data load took too long. Please try refreshing in 2-3 minutes.\n\nError: {e}")
         return None
     except Exception as e:
-        debug_log(f"❌ Unexpected error loading unified: {type(e).__name__}: {e}")
-        st.error(f"❌ Could not load unified data:\n\n**Error Type:** {type(e).__name__}\n**Message:** {e}")
+        debug_log(f"❌ Error loading unified: {type(e).__name__}: {str(e)[:200]}")
+        st.error(f"❌ Could not load unified data:\n\n**Error Type:** {type(e).__name__}\n**Message:** {str(e)[:500]}")
         return None
 
 @st.cache_data(ttl=3600)
 def load_demand_forecasts():
-    """Load demand forecasts with error handling"""
+    """Load demand forecasts with timeout"""
     try:
         debug_log("Loading demand_forecasts.parquet...")
-        df = pd.read_parquet(DEMAND_FORECASTS, engine='pyarrow')
+        df = pd.read_parquet(
+            DEMAND_FORECASTS, 
+            engine='pyarrow',
+            storage_options={
+                "anon": False,
+                "connect_timeout": 60,
+                "read_timeout": 180
+            }
+        )
         debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows")
         return df
     except Exception as e:
-        debug_log(f"⚠️  Could not load demand forecasts: {type(e).__name__}: {e}")
+        debug_log(f"⚠️  Could not load demand forecasts: {type(e).__name__}")
         return None
 
 @st.cache_data(ttl=3600)
 def load_trend_labels():
-    """Load trend labels with error handling"""
+    """Load trend labels with timeout"""
     try:
         debug_log("Loading trend_labels.parquet...")
-        df = pd.read_parquet(TREND_LABELS, engine='pyarrow')
+        df = pd.read_parquet(
+            TREND_LABELS, 
+            engine='pyarrow',
+            storage_options={
+                "anon": False,
+                "connect_timeout": 60,
+                "read_timeout": 180
+            }
+        )
         df["date"] = pd.to_datetime(df["date"])
         debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows")
         return df
     except Exception as e:
-        debug_log(f"⚠️  Could not load trend labels: {type(e).__name__}: {e}")
+        debug_log(f"⚠️  Could not load trend labels: {type(e).__name__}")
         return None
 
 # ─────────────────────────────────────────────

@@ -20,9 +20,8 @@ import glob
 # ─────────────────────────────────────────────
 IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
 
-# A more reliable way to detect Streamlit Cloud: check for the presence of secrets
-# OR if STREAMLIT_RUNTIME_VERSION exists, OR just default to True if not local/Databricks
-IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None or "AWS_ACCESS_KEY_ID" in st.secrets
+# Safely detect Streamlit Cloud (check env var only at module level)
+IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None
 
 if IS_STREAMLIT_CLOUD:
     # Read Secrets internally provided to Streamlit Cloud

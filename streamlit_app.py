@@ -43,29 +43,6 @@ if IS_STREAMLIT_CLOUD:
     STOCK_ANALYTICS = f"{S3_BASE}/stock_analytics.parquet"
     DEMAND_FORECASTS = f"{S3_BASE}/demand_forecasts.parquet"
     TREND_LABELS = f"{S3_BASE}/trend_labels.parquet"
-"""elif IS_DATABRICKS:
-    # Databricks Volumes paths (Unity Catalog)
-    PROCESSED_DIR = "/Volumes/workspace/default/data/processed"
-    CURATED_DIR = "/Volumes/workspace/default/data/curated"
-    
-    UNIFIED_PARQUET = os.path.join(PROCESSED_DIR, "unified.parquet")
-    PRICE_ANALYTICS = os.path.join(PROCESSED_DIR, "price_analytics.parquet")
-    DELIVERY_ANALYTICS = os.path.join(PROCESSED_DIR, "delivery_analytics.parquet")
-    REVENUE_ANALYTICS = os.path.join(PROCESSED_DIR, "revenue_analytics.parquet")
-    STOCK_ANALYTICS = os.path.join(PROCESSED_DIR, "stock_analytics.parquet")
-    DEMAND_FORECASTS = os.path.join(CURATED_DIR, "demand_forecasts.parquet")
-    TREND_LABELS = os.path.join(CURATED_DIR, "trend_labels.parquet")
-else:
-    # Local paths for development
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-    UNIFIED_PARQUET = os.path.join(BASE_DIR, "output", "processed", "unified.parquet")
-    PRICE_ANALYTICS = os.path.join(BASE_DIR, "output", "processed", "price_analytics.parquet")
-    DELIVERY_ANALYTICS = os.path.join(BASE_DIR, "output", "processed", "delivery_analytics.parquet")
-    REVENUE_ANALYTICS = os.path.join(BASE_DIR, "output", "processed", "revenue_analytics.parquet")
-    STOCK_ANALYTICS = os.path.join(BASE_DIR, "output", "processed", "stock_analytics.parquet")
-    DEMAND_FORECASTS = os.path.join(BASE_DIR, "output", "curated", "demand_forecasts.parquet")
-    TREND_LABELS = os.path.join(BASE_DIR, "output", "curated", "trend_labels.parquet")"""
 
 PLATFORM_COLORS = {"blinkit": "#F8C100", "zepto": "#7B2FF7", "swiggy": "#FC8019"}
 PLATFORM_ICONS = {"blinkit": "🟡", "zepto": "🟣", "swiggy": "🟠"}

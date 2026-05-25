@@ -18,7 +18,7 @@ import sys
 import s3fs
 
 # Set S3 region and configuration BEFORE any S3 operations
-os.environ[\"AWS_DEFAULT_REGION\"] = \"eu-north-1\"
+os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
 
 # ═════════════════════════════════════════════
 # DEBUG MODE - Show startup information

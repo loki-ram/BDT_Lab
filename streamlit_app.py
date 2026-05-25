@@ -18,6 +18,10 @@ import sys
 import s3fs
 
 # Set S3 region and configuration BEFORE any S3 operations
+# Set S3 timeouts and region BEFORE any S3 operations
+# These are crucial for avoiding hangs on Streamlit Cloud with large files
+os.environ["S3_CONNECT_TIMEOUT"] = "60"
+os.environ["S3_READ_TIMEOUT"] = "600"  # 5 minutes for 740MB file
 os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
 
 # ═════════════════════════════════════════════

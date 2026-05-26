@@ -1,525 +1,351 @@
 """
-streamlit_app.py — QuickCommerce Platform Recommender Dashboard
+streamlit_app.py — QuickCommerce Platform Recommender Dashboard (EC2-Optimised)
 
-Lets users pick product categories, adjust preference sliders
-(delivery time, price, product quality), and ranks platforms accordingly.
+Key changes vs original:
+  • Validates parquet files before reading (catches 0-byte / missing files)
+  • Streams parquet in small batches with hard row caps — never loads full 740 MB
+  • Catalog built from a 200 k-row scan instead of the full file
+  • Categorical dtypes throughout (saves ~60 % RAM vs object columns)
+  • Chart samples capped at 50 k rows
+  • All failures are graceful — the app keeps running even if S3 files are absent
 """
 
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-import numpy as np
-from datetime import datetime
-import os
-import json
-import glob
-import sys
-import s3fs
+import os, sys, json, glob
 from collections import Counter, defaultdict
+from datetime import datetime
 from typing import Optional, Sequence, Tuple
-import pyarrow.fs as pafs
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# ── S3 env vars must be set BEFORE any boto/s3fs import ──────────────────────
+os.environ.setdefault("S3_CONNECT_TIMEOUT", "30")
+os.environ.setdefault("S3_READ_TIMEOUT",    "120")
+os.environ.setdefault("AWS_DEFAULT_REGION", "eu-north-1")
 
 try:
     import pyarrow.parquet as pq
-except Exception:  # pragma: no cover
-    pq = None
+    import pyarrow.fs      as pafs
+except ImportError:
+    pq   = None
+    pafs = None
 
-# Set S3 region and configuration BEFORE any S3 operations
-# Set S3 timeouts and region BEFORE any S3 operations
-# These are crucial for avoiding hangs on Streamlit Cloud with large files
-os.environ["S3_CONNECT_TIMEOUT"] = "60"
-os.environ["S3_READ_TIMEOUT"] = "600"  # 5 minutes for 740MB file
-os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
-
-# ═════════════════════════════════════════════
-# DEBUG MODE - Show startup information
-# ═════════════════════════════════════════════
+# ── Debug helpers ─────────────────────────────────────────────────────────────
 DEBUG = True
 
-def debug_log(msg):
-    """Print debug messages to console and app"""
+def dbg(msg: str):
     if DEBUG:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"[{timestamp}] DEBUG: {msg}", file=sys.stderr)
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] DEBUG: {msg}", file=sys.stderr)
 
-debug_log("🚀 App initialization started")
+dbg("🚀 App init")
 
-# ─────────────────────────────────────────────
-# ENVIRONMENT & PATHS
-# ─────────────────────────────────────────────
-IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
-debug_log(f"IS_DATABRICKS: {IS_DATABRICKS}")
+# ── Environment detection ─────────────────────────────────────────────────────
+IS_DATABRICKS      = "DATABRICKS_RUNTIME_VERSION" in os.environ
+IS_STREAMLIT_CLOUD = (
+    os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None
+    or os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
+)
 
-# Better Streamlit Cloud detection - also check for specific cloud markers
-STREAMLIT_RUNTIME = os.environ.get("STREAMLIT_RUNTIME_VERSION")
-IS_STREAMLIT_CLOUD = STREAMLIT_RUNTIME is not None or os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
-debug_log(f"IS_STREAMLIT_CLOUD: {IS_STREAMLIT_CLOUD}")
-debug_log(f"STREAMLIT_RUNTIME_VERSION: {STREAMLIT_RUNTIME}")
-
-# Check AWS credentials - try multiple sources
-HAS_AWS_KEYS = "AWS_ACCESS_KEY_ID" in os.environ or "AWS_SECRET_ACCESS_KEY" in os.environ
-debug_log(f"AWS credentials in environment: {HAS_AWS_KEYS}")
-
-# Always try to load from secrets (works on Streamlit Cloud + local)
-try:
-    if not HAS_AWS_KEYS:
-        debug_log("Attempting to load AWS credentials from st.secrets...")
-        os.environ["AWS_ACCESS_KEY_ID"] = st.secrets.get("AWS_ACCESS_KEY_ID", "")
+# Load AWS creds from st.secrets if not already in env
+if not os.environ.get("AWS_ACCESS_KEY_ID"):
+    try:
+        os.environ["AWS_ACCESS_KEY_ID"]     = st.secrets.get("AWS_ACCESS_KEY_ID", "")
         os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets.get("AWS_SECRET_ACCESS_KEY", "")
-        os.environ["AWS_DEFAULT_REGION"] = "eu-north-1"
-        debug_log("✅ AWS credentials loaded from secrets")
-    else:
-        debug_log("✅ AWS credentials already in environment")
-except Exception as e:
-    debug_log(f"⚠️  Could not load secrets: {e}")
+        dbg("✅ AWS creds loaded from secrets")
+    except Exception as e:
+        dbg(f"⚠️  Secrets load failed: {e}")
 
-# S3 paths (works locally if AWS_ACCESS_KEY_ID is set in env or .streamlit/secrets.toml)
-S3_BASE = "s3://qcommerce-bdt-cct/parquets"
-BASE_DIR = S3_BASE
-UNIFIED_PARQUET = f"{S3_BASE}/unified.parquet"
-PRICE_ANALYTICS = f"{S3_BASE}/price_analytics.parquet"
-DELIVERY_ANALYTICS = f"{S3_BASE}/delivery_analytics.parquet"
-REVENUE_ANALYTICS = f"{S3_BASE}/revenue_analytics.parquet"
-STOCK_ANALYTICS = f"{S3_BASE}/stock_analytics.parquet"
+# ── S3 paths ──────────────────────────────────────────────────────────────────
+S3_BASE          = "s3://qcommerce-bdt-cct/parquets"
+UNIFIED_PARQUET  = f"{S3_BASE}/unified.parquet"
 DEMAND_FORECASTS = f"{S3_BASE}/demand_forecasts.parquet"
-TREND_LABELS = f"{S3_BASE}/trend_labels.parquet"
+TREND_LABELS     = f"{S3_BASE}/trend_labels.parquet"
 
 PLATFORM_COLORS = {"blinkit": "#F8C100", "zepto": "#7B2FF7", "swiggy": "#FC8019"}
-PLATFORM_ICONS = {"blinkit": "🟡", "zepto": "🟣", "swiggy": "🟠"}
+PLATFORM_ICONS  = {"blinkit": "🟡",      "zepto": "🟣",      "swiggy": "🟠"}
 
-# ─────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="QuickCommerce Platform Recommender",
+    page_title="QuickCommerce Recommender",
     page_icon="🛒",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-debug_log("✅ Streamlit page config set")
-
-# ─────────────────────────────────────────────
-# CUSTOM CSS
-# ─────────────────────────────────────────────
+# ── CSS (unchanged from original) ────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-.main-title {
-    font-size: 2.2rem; font-weight: 800;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    margin-bottom: 4px;
-}
-.sub-title { font-size: 1.05rem; color: #94a3b8; margin-bottom: 20px; }
-
-.rank-card {
-    background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
-    border-radius: 16px; padding: 24px; margin-bottom: 16px;
-    border-left: 5px solid; position: relative; overflow: hidden;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.15);
-}
-.rank-card::before {
-    content: ''; position: absolute; top: 0; right: 0;
-    width: 100px; height: 100px; border-radius: 50%;
-    filter: blur(40px); opacity: 0.3;
-}
-.rank-badge {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 44px; height: 44px; border-radius: 12px;
-    font-size: 1.3rem; font-weight: 800; color: #fff;
-    margin-bottom: 8px;
-}
-.rank-1 { background: linear-gradient(135deg, #f59e0b, #d97706); }
-.rank-2 { background: linear-gradient(135deg, #94a3b8, #64748b); }
-.rank-3 { background: linear-gradient(135deg, #b45309, #92400e); }
-
-.platform-name { font-size: 1.4rem; font-weight: 700; color: #f1f5f9; }
-.score-big { font-size: 2.4rem; font-weight: 800; color: #a78bfa; }
-.score-label { font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
-
-.metric-row { display: flex; gap: 16px; margin-top: 12px; flex-wrap: wrap; }
-.metric-pill {
-    background: rgba(255,255,255,0.06); border-radius: 10px;
-    padding: 8px 14px; flex: 1; min-width: 100px; text-align: center;
-}
-.metric-pill .val { font-size: 1.1rem; font-weight: 700; color: #e2e8f0; }
-.metric-pill .lbl { font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; }
-
-.sidebar-section {
-    background: rgba(255,255,255,0.03); border-radius: 12px;
-    padding: 16px; margin-bottom: 16px;
-    border: 1px solid rgba(255,255,255,0.06);
-}
-.sidebar-heading {
-    font-size: 0.85rem; font-weight: 700; color: #a78bfa;
-    text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 10px;
-}
-
-.insight-box {
-    background: linear-gradient(135deg, #1a1a2e, #16213e);
-    border-radius: 12px; padding: 16px; margin-top: 12px;
-    border: 1px solid rgba(167,139,250,0.2);
-}
-.insight-box .title { font-weight: 700; color: #a78bfa; margin-bottom: 6px; }
-.insight-box .text { color: #cbd5e1; font-size: 0.9rem; line-height: 1.5; }
-
-div[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f0f1a 0%, #1a1a2e 100%); }
+html,body,[class*="css"]{font-family:'Inter',sans-serif}
+.main-title{font-size:2.2rem;font-weight:800;background:linear-gradient(135deg,#667eea,#764ba2);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
+.sub-title{font-size:1.05rem;color:#94a3b8;margin-bottom:20px}
+.rank-card{background:linear-gradient(135deg,#1e1e2e,#2a2a3e);border-radius:16px;padding:24px;
+  margin-bottom:16px;border-left:5px solid;position:relative;overflow:hidden;
+  box-shadow:0 4px 24px rgba(0,0,0,.15)}
+.rank-badge{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;
+  border-radius:12px;font-size:1.3rem;font-weight:800;color:#fff;margin-bottom:8px}
+.rank-1{background:linear-gradient(135deg,#f59e0b,#d97706)}
+.rank-2{background:linear-gradient(135deg,#94a3b8,#64748b)}
+.rank-3{background:linear-gradient(135deg,#b45309,#92400e)}
+.platform-name{font-size:1.4rem;font-weight:700;color:#f1f5f9}
+.score-big{font-size:2.4rem;font-weight:800;color:#a78bfa}
+.score-label{font-size:.8rem;color:#94a3b8;text-transform:uppercase;letter-spacing:1px}
+.metric-row{display:flex;gap:16px;margin-top:12px;flex-wrap:wrap}
+.metric-pill{background:rgba(255,255,255,.06);border-radius:10px;padding:8px 14px;
+  flex:1;min-width:100px;text-align:center}
+.metric-pill .val{font-size:1.1rem;font-weight:700;color:#e2e8f0}
+.metric-pill .lbl{font-size:.7rem;color:#94a3b8;text-transform:uppercase}
+.insight-box{background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:12px;
+  padding:16px;margin-top:12px;border:1px solid rgba(167,139,250,.2)}
+.insight-box .title{font-weight:700;color:#a78bfa;margin-bottom:6px}
+.insight-box .text{color:#cbd5e1;font-size:.9rem;line-height:1.5}
+div[data-testid="stSidebar"]{background:linear-gradient(180deg,#0f0f1a,#1a1a2e)}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────
-# DATA LOADING
-# ─────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def load_unified():
-    """Load unified data from S3 with selective columns to minimize memory"""
-    try:
-        debug_log(f"Loading unified.parquet from {UNIFIED_PARQUET}...")
-        debug_log(f"AWS_ACCESS_KEY_ID present: {'AWS_ACCESS_KEY_ID' in os.environ}")
-        debug_log(f"AWS_SECRET_ACCESS_KEY present: {'AWS_SECRET_ACCESS_KEY' in os.environ}")
-        
-        # Only load columns we actually use - reduces 740MB → ~150MB
-        columns_needed = [
-            "platform", "category", "product_name", 
-            "delivery_minutes", "effective_price", "rating",
-            "units_ordered", "stock_remaining", "in_stock", "snapshot_time"
-        ]
-        
-        with st.spinner("📥 Loading platform data from S3... this may take 1-2 minutes"):
-            # Use pyarrow with s3 filesystem and selective columns
-            df = pd.read_parquet(
-                UNIFIED_PARQUET, 
-                engine='pyarrow',
-                columns=columns_needed,
-                storage_options={"anon": False}
-            )
-            df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
-            
-            # Massive memory optimization: Convert object columns to categoricals
-            for col in ["platform", "category", "product_name"]:
-                df[col] = df[col].astype("category")
-                
-        debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols (memory optimized)")
-        return df
-    except TimeoutError as e:
-        debug_log(f"⏱️  S3 timeout: {e}")
-        st.error(f"⏱️  S3 Connection Timeout: Data load took too long. Please try refreshing in 1-2 minutes.\n\nError: {e}")
-        return None
-    except Exception as e:
-        debug_log(f"❌ Error loading unified: {type(e).__name__}: {str(e)[:200]}")
-        st.error(f"❌ Could not load unified data:\n\n**Error Type:** {type(e).__name__}\n**Message:** {str(e)[:500]}")
-        return None
+# ═════════════════════════════════════════════════════════════════════════════
+# LOW-LEVEL PARQUET UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=3600)
-def load_demand_forecasts():
-    """Load demand forecasts with selective columns"""
-    try:
-        debug_log("Loading demand_forecasts.parquet...")
-        # Only load columns we use
-        columns_needed = ["platform", "category", "product_name", "predicted_demand", "units_ordered"]
-        
-        df = pd.read_parquet(
-            DEMAND_FORECASTS, 
-            engine='pyarrow',
-            columns=columns_needed,
-            storage_options={"anon": False}
-        )
-        
-        # Categorical memory optimization
-        for col in ["platform", "category", "product_name"]:
-            if col in df.columns:
-                df[col] = df[col].astype("category")
-                
-        debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows (memory optimized)")
-        return df
-    except Exception as e:
-        debug_log(f"⚠️  Could not load demand forecasts: {type(e).__name__}")
-        return None
-
-@st.cache_data(ttl=3600)
-def load_trend_labels():
-    """Load trend labels with selective columns"""
-    try:
-        debug_log("Loading trend_labels.parquet...")
-        # Only load columns we use
-        columns_needed = ["platform", "category", "product_name", "date", "daily_demand", 
-                          "rolling_avg_7d", "trend_label", "predicted_label_idx"]
-        
-        df = pd.read_parquet(
-            TREND_LABELS, 
-            engine='pyarrow',
-            columns=columns_needed,
-            storage_options={"anon": False}
-        )
-        df["date"] = pd.to_datetime(df["date"])
-        
-        # Categorical memory optimization
-        for col in ["platform", "category", "product_name", "trend_label"]:
-            if col in df.columns:
-                df[col] = df[col].astype("category")
-                
-        debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows (memory optimized)")
-        return df
-    except Exception as e:
-        debug_log(f"⚠️  Could not load trend labels: {type(e).__name__}")
-        return None
-
-# ─────────────────────────────────────────────
-# SCORING LOGIC
-# ─────────────────────────────────────────────
 @st.cache_resource
-def _s3_filesystem():
-    # Reuse the same S3 client across reruns.
+def _s3fs():
+    """Reusable S3FileSystem — created once per process."""
+    if pafs is None:
+        return None
     region = os.environ.get("AWS_DEFAULT_REGION") or None
     return pafs.S3FileSystem(region=region)
 
 
-def _parquet_path(path: str):
+def _pq_path(path: str):
+    """Return (filesystem_or_None, bare_path)."""
     if path.startswith("s3://"):
-        return _s3_filesystem(), path.replace("s3://", "", 1)
+        return _s3fs(), path.replace("s3://", "", 1)
     return None, path
 
 
-def _ensure_pyarrow():
-    if pq is None:
-        st.error("pyarrow is required for streaming Parquet reads. Please add `pyarrow` to your requirements.")
-        st.stop()
+def _file_is_valid(path: str) -> bool:
+    """
+    Return True only if the parquet file exists AND is non-empty.
+    This is the guard that prevents the 0-byte crash.
+    """
+    if pq is None or pafs is None:
+        return False
+    try:
+        fs, bare = _pq_path(path)
+        info = fs.get_file_info(bare) if fs else None
+        if info is None:
+            # local file
+            return os.path.isfile(bare) and os.path.getsize(bare) > 0
+        # S3: FileType.File == 2 in pyarrow ≥ 12
+        return info.type.value == 2 and (info.size or 0) > 0
+    except Exception as e:
+        dbg(f"_file_is_valid({path}): {e}")
+        return False
 
 
 @st.cache_data(ttl=3600, max_entries=20)
-def _load_parquet_sample(
+def _stream_parquet(
     path: str,
-    columns: Sequence[str],
+    columns: Tuple[str, ...],
     max_rows: int,
-    categories: Optional[Tuple[str, ...]] = None,
-    products: Optional[Tuple[str, ...]] = None,
+    filter_categories: Optional[Tuple[str, ...]] = None,
+    filter_products: Optional[Tuple[str, ...]] = None,
+    batch_size: int = 65_536,
     seed: int = 42,
-    batch_size: int = 65536,
-):
+) -> Optional[pd.DataFrame]:
     """
-    Stream Parquet in batches and keep at most `max_rows` rows in memory.
+    Stream a Parquet file in batches and return AT MOST `max_rows` rows.
 
-    The goal is bounded memory + "enough" data for stable charts on small EC2 instances.
+    Strategy
+    --------
+    * With NO filters  → scan up to `scan_budget` rows then stop; subsample each
+      batch so memory stays bounded even before concat.
+    * With filters     → scan more of the file but still cap the output.
+
+    This means the app never holds the full 740 MB file in RAM.
     """
-    _ensure_pyarrow()
+    if not _file_is_valid(path):
+        dbg(f"⛔ Skipping {path}: file missing or 0 bytes")
+        return None
+    if pq is None:
+        dbg("pyarrow not available")
+        return None
 
-    categories_set = set(categories or ())
-    products_set = set(products or ())
-    rng = np.random.default_rng(seed)
+    cats_set  = set(filter_categories or ())
+    prods_set = set(filter_products  or ())
+    rng       = np.random.default_rng(seed)
 
-    rows_collected = 0
-    scanned_rows = 0
-    # With no filters, don't scan the entire file: read a bounded prefix.
-    scan_row_budget = max(500_000, max_rows * 20) if (not categories_set and not products_set) else max(2_000_000, max_rows * 60)
+    # How many source rows to scan before giving up
+    scan_budget = (
+        max(800_000, max_rows * 20) if not (cats_set or prods_set)
+        else max(3_000_000, max_rows * 60)
+    )
 
-    chunks = []
+    chunks, collected, scanned = [], 0, 0
     try:
-        filesystem, parquet_path = _parquet_path(path)
-        pf = pq.ParquetFile(parquet_path, filesystem=filesystem)
+        fs, bare = _pq_path(path)
+        pf = pq.ParquetFile(bare, filesystem=fs)
         for batch in pf.iter_batches(batch_size=batch_size, columns=list(columns), use_threads=True):
-            scanned_rows += batch.num_rows
+            scanned += batch.num_rows
             dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
 
-            if categories_set and "category" in dfb.columns:
-                dfb = dfb[dfb["category"].isin(categories_set)]
-            if products_set and "product_name" in dfb.columns:
-                dfb = dfb[dfb["product_name"].isin(products_set)]
-
+            if cats_set  and "category"     in dfb.columns: dfb = dfb[dfb["category"    ].isin(cats_set )]
+            if prods_set and "product_name" in dfb.columns: dfb = dfb[dfb["product_name"].isin(prods_set)]
             if dfb.empty:
-                if scanned_rows >= scan_row_budget:
-                    break
+                if scanned >= scan_budget: break
                 continue
 
-            remaining = max_rows - rows_collected
-            if remaining <= 0:
-                break
+            remaining = max_rows - collected
+            if remaining <= 0: break
 
-            # Broad scan: take a small number of rows per batch to keep sampling spread out.
-            if not categories_set and not products_set:
-                per_batch_cap = max(2_000, max_rows // 50)
-                take_n = min(len(dfb), per_batch_cap, remaining)
-            else:
-                take_n = min(len(dfb), remaining)
-
-            if take_n < len(dfb):
-                dfb = dfb.sample(n=take_n, random_state=int(rng.integers(0, 2**31 - 1)), ignore_index=True)
-            else:
-                dfb = dfb.reset_index(drop=True)
+            # cap per-batch contribution to spread sampling across the file
+            per_batch_cap = max(2_000, max_rows // 50) if not (cats_set or prods_set) else remaining
+            take = min(len(dfb), per_batch_cap, remaining)
+            if take < len(dfb):
+                dfb = dfb.sample(n=take, random_state=int(rng.integers(0, 2**31 - 1)), ignore_index=True)
 
             chunks.append(dfb)
-            rows_collected += len(dfb)
-
-            if rows_collected >= max_rows or scanned_rows >= scan_row_budget:
+            collected += len(dfb)
+            if collected >= max_rows or scanned >= scan_budget:
                 break
 
         if not chunks:
             return pd.DataFrame(columns=list(columns))
-
         df = pd.concat(chunks, ignore_index=True)
-        if "snapshot_time" in df.columns:
-            df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce")
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in ("snapshot_time", "date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        dbg(f"✅ {path.split('/')[-1]}: {len(df):,} rows (scanned {scanned:,})")
         return df
-    except TimeoutError as e:
-        debug_log(f"⏱️  S3 timeout while reading {path}: {e}")
-        return None
     except Exception as e:
-        debug_log(f"❌ Parquet streaming read failed for {path}: {type(e).__name__}: {str(e)[:200]}")
+        dbg(f"❌ _stream_parquet({path}): {type(e).__name__}: {str(e)[:200]}")
         return None
 
 
-@st.cache_data(ttl=3600, max_entries=2)
-def load_unified_catalog(scan_rows: int = 400_000, max_products_total: int = 5000, max_products_per_cat: int = 1500):
-    """
-    Build a lightweight catalog for sidebar widgets without loading the full unified parquet.
-    We scan only a bounded number of rows and keep the most common products.
-    """
-    _ensure_pyarrow()
+# ═════════════════════════════════════════════════════════════════════════════
+# CATALOG (sidebar lists)  — built from a tiny scan
+# ═════════════════════════════════════════════════════════════════════════════
 
-    columns = ["category", "product_name", "units_ordered"]
-    categories = set()
-    product_counts = Counter()
-    per_cat_counts = defaultdict(Counter)
+@st.cache_data(ttl=3600)
+def build_catalog(scan_rows: int = 200_000) -> Optional[dict]:
+    """
+    Build category / product lists by scanning only `scan_rows` source rows.
+    Returns None if the file is missing/empty, so the caller can show a helpful
+    error instead of crashing.
+    """
+    if not _file_is_valid(UNIFIED_PARQUET):
+        dbg("⛔ build_catalog: unified.parquet missing or 0 bytes")
+        return None
+
+    cols = ("category", "product_name", "units_ordered")
+    categories: set           = set()
+    product_counts: Counter   = Counter()
+    per_cat: dict             = defaultdict(Counter)
     scanned = 0
 
     try:
-        filesystem, parquet_path = _parquet_path(UNIFIED_PARQUET)
-        pf = pq.ParquetFile(parquet_path, filesystem=filesystem)
-        for batch in pf.iter_batches(batch_size=65536, columns=columns, use_threads=True):
+        fs, bare = _pq_path(UNIFIED_PARQUET)
+        pf = pq.ParquetFile(bare, filesystem=fs)
+        for batch in pf.iter_batches(batch_size=65_536, columns=list(cols), use_threads=True):
             scanned += batch.num_rows
             dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
             dfb = dfb.dropna(subset=["category", "product_name"])
             if dfb.empty:
-                if scanned >= scan_rows:
-                    break
+                if scanned >= scan_rows: break
                 continue
 
             categories.update(dfb["category"].unique().tolist())
 
-            # Prefer units_ordered as a proxy for "popular products", fallback to frequency.
-            if "units_ordered" in dfb.columns and pd.api.types.is_numeric_dtype(dfb["units_ordered"]):
-                prod_sum = dfb.groupby("product_name")["units_ordered"].sum()
-                for k, v in prod_sum.items():
-                    product_counts[k] += float(v)
-
-                cat_prod_sum = dfb.groupby(["category", "product_name"])["units_ordered"].sum()
-                for (cat, prod), v in cat_prod_sum.items():
-                    per_cat_counts[cat][prod] += float(v)
+            if pd.api.types.is_numeric_dtype(dfb.get("units_ordered", pd.Series(dtype=float))):
+                for (cat, prod), v in dfb.groupby(["category", "product_name"])["units_ordered"].sum().items():
+                    product_counts[prod]   += float(v)
+                    per_cat[cat][prod]     += float(v)
             else:
-                vc = dfb["product_name"].value_counts()
-                for k, v in vc.items():
-                    product_counts[k] += int(v)
+                for prod, v in dfb["product_name"].value_counts().items():
+                    product_counts[prod] += int(v)
                 for cat, sub in dfb.groupby("category"):
-                    vc2 = sub["product_name"].value_counts()
-                    for k, v in vc2.items():
-                        per_cat_counts[cat][k] += int(v)
+                    for prod, v in sub["product_name"].value_counts().items():
+                        per_cat[cat][prod] += int(v)
 
             if scanned >= scan_rows:
                 break
 
-        cat_list = sorted([c for c in categories if c is not None])
-        top_products = [p for p, _ in product_counts.most_common(max_products_total)]
-        products_by_category = {cat: [p for p, _ in cnt.most_common(max_products_per_cat)] for cat, cnt in per_cat_counts.items()}
-        return {"categories": cat_list, "top_products": top_products, "products_by_category": products_by_category}
+        return {
+            "categories":           sorted(c for c in categories if c),
+            "top_products":         [p for p, _ in product_counts.most_common(5_000)],
+            "products_by_category": {cat: [p for p, _ in cnt.most_common(1_500)]
+                                     for cat, cnt in per_cat.items()},
+        }
     except Exception as e:
-        debug_log(f"⚠️  Could not build catalog: {type(e).__name__}: {str(e)[:200]}")
+        dbg(f"❌ build_catalog: {type(e).__name__}: {str(e)[:200]}")
         return None
 
 
-@st.cache_data(ttl=3600, max_entries=10)
-def load_unified_sample(categories: Optional[Tuple[str, ...]], products: Optional[Tuple[str, ...]], max_rows: int, seed: int = 42):
-    columns_needed = [
-        "platform",
-        "category",
-        "product_name",
-        "delivery_minutes",
-        "effective_price",
-        "rating",
-        "units_ordered",
-        "stock_remaining",
-        "in_stock",
-        "snapshot_time",
-    ]
-    return _load_parquet_sample(
-        UNIFIED_PARQUET,
-        columns=columns_needed,
-        max_rows=max_rows,
-        categories=categories,
-        products=products,
-        seed=seed,
-    )
+# ═════════════════════════════════════════════════════════════════════════════
+# TYPED LOADERS  (thin wrappers around _stream_parquet)
+# ═════════════════════════════════════════════════════════════════════════════
+
+UNIFIED_COLS = (
+    "platform", "category", "product_name",
+    "delivery_minutes", "effective_price", "rating",
+    "units_ordered", "stock_remaining", "in_stock", "snapshot_time",
+)
+DEMAND_COLS  = ("platform", "category", "product_name", "predicted_demand", "units_ordered")
+TREND_COLS   = ("platform", "category", "product_name", "date",
+                "daily_demand", "rolling_avg_7d", "trend_label", "predicted_label_idx")
 
 
-@st.cache_data(ttl=3600, max_entries=10)
-def load_demand_forecasts(categories: Optional[Tuple[str, ...]] = None, products: Optional[Tuple[str, ...]] = None, max_rows: int = 80_000):
-    columns_needed = ["platform", "category", "product_name", "predicted_demand", "units_ordered"]
-    return _load_parquet_sample(
-        DEMAND_FORECASTS,
-        columns=columns_needed,
-        max_rows=max_rows,
-        categories=categories,
-        products=products,
-        seed=42,
-    )
+def load_unified(cats, prods, max_rows):
+    return _stream_parquet(UNIFIED_PARQUET, UNIFIED_COLS, max_rows,
+                           filter_categories=cats, filter_products=prods)
+
+def load_demand(cats, prods, max_rows=80_000):
+    return _stream_parquet(DEMAND_FORECASTS, DEMAND_COLS, max_rows,
+                           filter_categories=cats, filter_products=prods)
+
+def load_trends(cats, prods, max_rows=80_000):
+    return _stream_parquet(TREND_LABELS, TREND_COLS, max_rows,
+                           filter_categories=cats, filter_products=prods)
 
 
-@st.cache_data(ttl=3600, max_entries=10)
-def load_trend_labels(categories: Optional[Tuple[str, ...]] = None, products: Optional[Tuple[str, ...]] = None, max_rows: int = 80_000):
-    columns_needed = ["platform", "category", "product_name", "date", "daily_demand", "rolling_avg_7d", "trend_label", "predicted_label_idx"]
-    return _load_parquet_sample(
-        TREND_LABELS,
-        columns=columns_needed,
-        max_rows=max_rows,
-        categories=categories,
-        products=products,
-        seed=42,
-    )
+# ═════════════════════════════════════════════════════════════════════════════
+# SCORING
+# ═════════════════════════════════════════════════════════════════════════════
 
-
-def compute_platform_scores(df, w_delivery, w_price, w_quality):
-    """
-    For each platform compute normalised scores for delivery, price and quality,
-    then combine them using the user-supplied weights.
-    Lower delivery time is better, lower price is better, higher rating is better.
-    """
+def compute_scores(df, w_delivery, w_price, w_quality):
     agg = df.groupby("platform").agg(
-        avg_delivery=("delivery_minutes", "mean"),
-        avg_price=("effective_price", "mean"),
-        avg_rating=("rating", "mean"),
-        product_count=("product_name", "nunique"),
-        total_orders=("units_ordered", "sum"),
-        avg_stock=("stock_remaining", "mean"),
-        in_stock_pct=("in_stock", "mean"),
+        avg_delivery  = ("delivery_minutes",  "mean"),
+        avg_price     = ("effective_price",    "mean"),
+        avg_rating    = ("rating",             "mean"),
+        product_count = ("product_name",      "nunique"),
+        total_orders  = ("units_ordered",      "sum"),
+        avg_stock     = ("stock_remaining",    "mean"),
+        in_stock_pct  = ("in_stock",           "mean"),
     ).reset_index()
 
-    # Normalise 0-100 (invert delivery & price so lower = better score)
     def norm(s, invert=False):
         mn, mx = s.min(), s.max()
         if mx == mn:
-            return pd.Series([50.0] * len(s))
+            return pd.Series([50.0] * len(s), index=s.index)
         n = (s - mn) / (mx - mn) * 100
         return 100 - n if invert else n
 
     agg["delivery_score"] = norm(agg["avg_delivery"], invert=True)
-    agg["price_score"] = norm(agg["avg_price"], invert=True)
-    agg["quality_score"] = norm(agg["avg_rating"], invert=False)
+    agg["price_score"]    = norm(agg["avg_price"],    invert=True)
+    agg["quality_score"]  = norm(agg["avg_rating"],   invert=False)
 
-    total_w = w_delivery + w_price + w_quality
-    if total_w == 0:
-        total_w = 1
-
+    tw = max(w_delivery + w_price + w_quality, 1)
     agg["overall_score"] = (
         agg["delivery_score"] * w_delivery
-        + agg["price_score"] * w_price
+        + agg["price_score"]  * w_price
         + agg["quality_score"] * w_quality
-    ) / total_w
+    ) / tw
 
     agg["in_stock_pct"] = agg["in_stock_pct"] * 100
     agg = agg.sort_values("overall_score", ascending=False).reset_index(drop=True)
@@ -527,603 +353,486 @@ def compute_platform_scores(df, w_delivery, w_price, w_quality):
     return agg
 
 
-# ─────────────────────────────────────────────
-# MAIN APP
-# ─────────────────────────────────────────────
-debug_log("Attempting to load sidebar catalog...")
+# ═════════════════════════════════════════════════════════════════════════════
+# DEMO DATA  — shown when S3 is unavailable
+# ═════════════════════════════════════════════════════════════════════════════
 
-with st.spinner("⏳ Initializing app and loading data from S3..."):
-    catalog = load_unified_catalog()
+def _demo_unified() -> pd.DataFrame:
+    """Small synthetic dataset so the UI is never completely broken."""
+    rng = np.random.default_rng(0)
+    platforms   = ["blinkit", "zepto", "swiggy"]
+    categories  = ["Fruits & Vegs", "Dairy", "Snacks", "Beverages", "Personal Care"]
+    products    = ["Product A", "Product B", "Product C", "Product D", "Product E"]
+    n = 3_000
+    return pd.DataFrame({
+        "platform":         rng.choice(platforms, n),
+        "category":         rng.choice(categories, n),
+        "product_name":     rng.choice(products, n),
+        "delivery_minutes": rng.uniform(8, 45, n),
+        "effective_price":  rng.uniform(20, 500, n),
+        "rating":           rng.uniform(3.0, 5.0, n),
+        "units_ordered":    rng.integers(1, 200, n).astype(float),
+        "stock_remaining":  rng.integers(0, 500, n).astype(float),
+        "in_stock":         rng.choice([0, 1], n, p=[0.1, 0.9]).astype(float),
+        "snapshot_time":    pd.date_range("2024-01-01", periods=n, freq="1min"),
+    })
 
-if not catalog or not catalog.get("categories"):
-    st.markdown("""
-    <div style="background: #fee2e2; border: 1px solid #fca5a5; border-radius: 8px; padding: 16px; margin: 16px 0;">
-        <h3 style="color: #991b1b; margin-top: 0;">⚠️ Data Loading Failed</h3>
-        <p><strong>Possible causes:</strong></p>
-        <ul>
-            <li>❌ AWS credentials not set in Streamlit Secrets</li>
-            <li>❌ S3 bucket is not accessible</li>
-            <li>❌ Network timeout (S3 is slow)</li>
-            <li>❌ IAM permissions missing</li>
-        </ul>
-        <p><strong>Next steps:</strong></p>
-        <ol>
-            <li>Go to Settings → Secrets</li>
-            <li>Add your AWS credentials:</li>
-            <code>AWS_ACCESS_KEY_ID = "your-key"<br>AWS_SECRET_ACCESS_KEY = "your-secret"</code>
-            <li>Click Save and wait 1-2 minutes for app to redeploy</li>
-            <li>Refresh this page</li>
-        </ol>
-    </div>
-    """, unsafe_allow_html=True)
-    debug_log("⛔ App stopped: Could not load catalog")
-    st.stop()
+def _demo_catalog() -> dict:
+    df = _demo_unified()
+    return {
+        "categories":           sorted(df["category"].unique().tolist()),
+        "top_products":         df["product_name"].unique().tolist(),
+        "products_by_category": {cat: df[df["category"] == cat]["product_name"].unique().tolist()
+                                 for cat in df["category"].unique()},
+    }
 
-# ---------- SIDEBAR ----------
-st.sidebar.markdown('<div class="sidebar-heading">⚙️ Performance</div>', unsafe_allow_html=True)
-default_unified_rows = int(os.environ.get("UNIFIED_SAMPLE_ROWS", "200000"))
-unified_sample_rows = st.sidebar.slider(
-    "Max rows to load (sample)",
-    min_value=50000,
-    max_value=500000,
-    value=max(50000, min(500000, default_unified_rows)),
-    step=50000,
-    help="Loads a capped sample from the large Parquet file to stay within EC2 memory limits.",
+
+# ═════════════════════════════════════════════════════════════════════════════
+# APP  — sidebar
+# ═════════════════════════════════════════════════════════════════════════════
+
+dbg("Building catalog…")
+with st.spinner("⏳ Connecting to S3 and building catalog…"):
+    catalog = build_catalog()
+
+USING_DEMO = False
+if catalog is None:
+    st.warning(
+        "⚠️  **Live data unavailable** — `unified.parquet` is missing or empty on S3.  "
+        "Showing a **demo dataset** so you can explore the UI.  \n\n"
+        "To fix: upload a valid parquet file to `s3://qcommerce-bdt-cct/parquets/unified.parquet`."
+    )
+    catalog = _demo_catalog()
+    USING_DEMO = True
+    dbg("Using demo data")
+
+# ---------- sidebar controls ----------
+st.sidebar.markdown("### ⚙️ Performance")
+default_rows  = int(os.environ.get("UNIFIED_SAMPLE_ROWS", "150000"))
+sample_rows   = st.sidebar.slider(
+    "Max rows to sample",
+    min_value=50_000, max_value=400_000,
+    value=max(50_000, min(400_000, default_rows)),
+    step=50_000,
+    help="Cap on rows read from the large Parquet file. Lower = faster & less RAM.",
 )
 
-st.sidebar.markdown('<div class="sidebar-heading">📂 Category Selection</div>', unsafe_allow_html=True)
-all_categories = catalog.get("categories", [])
-selected_categories = st.sidebar.multiselect(
-    "Select Categories",
-    options=all_categories,
-    default=[],
-    help="Filter by product category. Leave empty to include all categories.",
-)
+st.sidebar.markdown("### 📂 Category")
+all_cats          = catalog.get("categories", [])
+selected_cats     = st.sidebar.multiselect("Select Categories", options=all_cats, default=[])
 
-st.sidebar.markdown('<div class="sidebar-heading">🛒 Product Selection</div>', unsafe_allow_html=True)
-
-# Candidate products come from the lightweight catalog (bounded scan).
-product_query = st.sidebar.text_input(
-    "Search Products",
-    value="",
-    help="Type to filter the product list. This avoids loading all products into the widget.",
-)
-
-if selected_categories:
-    candidate_products = []
-    products_by_category = catalog.get("products_by_category", {})
-    for cat in selected_categories:
-        candidate_products.extend(products_by_category.get(cat, []))
-    if not candidate_products:
-        candidate_products = catalog.get("top_products", [])
+st.sidebar.markdown("### 🛒 Products")
+product_query = st.sidebar.text_input("Search Products", value="",
+                                      help="Type to filter the product list.")
+if selected_cats:
+    cands = []
+    for cat in selected_cats:
+        cands.extend(catalog.get("products_by_category", {}).get(cat, []))
+    cands = cands or catalog.get("top_products", [])
 else:
-    candidate_products = catalog.get("top_products", [])
+    cands = catalog.get("top_products", [])
 
-# De-dupe while preserving order
-candidate_products = list(dict.fromkeys([p for p in candidate_products if p is not None]))
+cands = list(dict.fromkeys(p for p in cands if p))
 if product_query.strip():
-    q = product_query.strip().lower()
-    candidate_products = [p for p in candidate_products if q in str(p).lower()]
+    q     = product_query.strip().lower()
+    cands = [p for p in cands if q in str(p).lower()]
+if len(cands) > 2_000:
+    st.sidebar.caption(f"Showing first 2,000 of {len(cands):,} products.")
+    cands = cands[:2_000]
 
-MAX_PRODUCT_OPTIONS = 2000
-if len(candidate_products) > MAX_PRODUCT_OPTIONS:
-    st.sidebar.caption(f"Showing {MAX_PRODUCT_OPTIONS:,} products (refine search to narrow).")
-    candidate_products = candidate_products[:MAX_PRODUCT_OPTIONS]
-
-selected_products = st.sidebar.multiselect(
-    "Select Products",
-    options=candidate_products,
-    default=[],
-    help="Choose one or more products to compare platforms. Leave empty to use all products in selected categories.",
-)
+selected_prods = st.sidebar.multiselect("Select Products", options=cands, default=[])
 
 st.sidebar.markdown("---")
-st.sidebar.markdown('<div class="sidebar-heading">⚖️ Your Preferences</div>', unsafe_allow_html=True)
-st.sidebar.caption("Drag the sliders to tell us what matters most to you. All charts — including ML analytics — update based on these weights.")
-
-w_delivery = st.sidebar.slider("🚚  Delivery Speed", 0, 10, 5, help="How important is fast delivery?")
-w_price = st.sidebar.slider("💰  Low Price", 0, 10, 5, help="How important is a lower price?")
-w_quality = st.sidebar.slider("⭐  Product Quality / Rating", 0, 10, 5, help="How important are product ratings?")
+st.sidebar.markdown("### ⚖️ Your Preferences")
+st.sidebar.caption("Sliders affect rankings AND the ML analytics below.")
+w_delivery = st.sidebar.slider("🚚 Delivery Speed",        0, 10, 5)
+w_price    = st.sidebar.slider("💰 Low Price",              0, 10, 5)
+w_quality  = st.sidebar.slider("⭐ Product Quality/Rating", 0, 10, 5)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown('<div class="sidebar-heading">ℹ️ Weights Breakdown</div>', unsafe_allow_html=True)
-total_w = w_delivery + w_price + w_quality or 1
+tw = max(w_delivery + w_price + w_quality, 1)
 st.sidebar.markdown(f"""
 | Factor | Weight | Share |
-|--------|--------|-------|
-| 🚚 Delivery | **{w_delivery}** | {w_delivery/total_w*100:.0f}% |
-| 💰 Price | **{w_price}** | {w_price/total_w*100:.0f}% |
-| ⭐ Quality | **{w_quality}** | {w_quality/total_w*100:.0f}% |
+|---|---|---|
+| 🚚 Delivery | **{w_delivery}** | {w_delivery/tw*100:.0f}% |
+| 💰 Price    | **{w_price}**    | {w_price/tw*100:.0f}%    |
+| ⭐ Quality  | **{w_quality}**  | {w_quality/tw*100:.0f}%  |
 """)
 
-# ---------- LOAD & FILTER DATA (SAMPLED) ----------
-cats_tuple = tuple(selected_categories) if selected_categories else None
-prods_tuple = tuple(selected_products) if selected_products else None
-with st.spinner("📥 Loading a data sample for analysis..."):
-    unified_df = load_unified_sample(cats_tuple, prods_tuple, max_rows=int(unified_sample_rows))
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LOAD MAIN DATA
+# ═════════════════════════════════════════════════════════════════════════════
+
+cats_t  = tuple(selected_cats)  or None
+prods_t = tuple(selected_prods) or None
+
+if USING_DEMO:
+    unified_df = _demo_unified()
+else:
+    with st.spinner("📥 Loading data sample from S3…"):
+        unified_df = load_unified(cats_t, prods_t, max_rows=int(sample_rows))
 
 if unified_df is None or unified_df.empty:
-    st.warning("No data could be loaded for the selected filters. Try broadening your selection or increasing the sample size.")
+    st.error("No data loaded. Try broadening your filters or increasing the sample size.")
     st.stop()
 
-filtered = unified_df
-if selected_categories:
-    filtered = filtered[filtered["category"].isin(selected_categories)]
-if selected_products:
-    filtered = filtered[filtered["product_name"].isin(selected_products)]
-
+# apply sidebar filters (may already be pre-filtered by the loader, but be safe)
+filtered = unified_df.copy()
+if selected_cats:  filtered = filtered[filtered["category"    ].isin(selected_cats )]
+if selected_prods: filtered = filtered[filtered["product_name"].isin(selected_prods)]
 if filtered.empty:
-    st.warning("No data matches the selected filters. Please adjust your selection.")
+    st.warning("No rows match your current filters. Please broaden the selection.")
     st.stop()
 
-# Smart sampling for visualizations - keep aggregations accurate but sample for charts
-# This prevents memory overload with 14M rows
-CHART_SAMPLE_SIZE = 100000
-if len(filtered) > CHART_SAMPLE_SIZE:
-    filtered_chart = filtered.sample(n=CHART_SAMPLE_SIZE, random_state=42)
-    debug_log(f"Sampled {CHART_SAMPLE_SIZE} rows from {len(filtered)} for visualization")
-else:
-    filtered_chart = filtered
-    debug_log(f"Using all {len(filtered)} rows for visualization")
+# cap chart sample to avoid browser rendering lag
+CHART_CAP   = 50_000
+chart_df    = filtered.sample(n=CHART_CAP, random_state=42) if len(filtered) > CHART_CAP else filtered
+dbg(f"filtered={len(filtered):,}  chart_df={len(chart_df):,}")
 
-# ---------- HEADER ----------
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HEADER + TOP METRICS
+# ═════════════════════════════════════════════════════════════════════════════
+
+if USING_DEMO:
+    st.info("🧪 **Demo mode** — displaying synthetic data. Connect S3 to see live results.")
+
 st.markdown('<div class="main-title">🛒 QuickCommerce Platform Recommender</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Pick your products, set your priorities — we\'ll rank the best platform for you</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Pick your products · set your priorities · find the best platform</div>', unsafe_allow_html=True)
 
-# ---------- COMPUTE SCORES ----------
-scores = compute_platform_scores(filtered, w_delivery, w_price, w_quality)
+scores = compute_scores(filtered, w_delivery, w_price, w_quality)
 
-# ---------- TOP METRICS ----------
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("📦 Products Matched", f"{filtered['product_name'].nunique()}")
-c2.metric("📄 Records (Sampled)", f"{len(filtered):,}")
-c3.metric("🏆 Top Platform", f"{PLATFORM_ICONS.get(scores.iloc[0]['platform'],'')} {scores.iloc[0]['platform'].title()}")
-c4.metric("🎯 Top Score", f"{scores.iloc[0]['overall_score']:.1f} / 100")
+c1.metric("📦 Products Matched",  f"{filtered['product_name'].nunique():,}")
+c2.metric("📄 Records (sampled)", f"{len(filtered):,}")
+c3.metric("🏆 Top Platform",
+          f"{PLATFORM_ICONS.get(scores.iloc[0]['platform'],'')} {scores.iloc[0]['platform'].title()}")
+c4.metric("🎯 Top Score",        f"{scores.iloc[0]['overall_score']:.1f} / 100")
 
 st.markdown("---")
 
-# ─────────────────────────────────────────────
-# PLATFORM RANKING CARDS
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RANKING CARDS
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("### 🏅 Platform Rankings")
-
 for _, row in scores.iterrows():
-    rank = int(row["rank"])
-    plat = row["platform"]
+    rank  = int(row["rank"])
+    plat  = row["platform"]
     color = PLATFORM_COLORS.get(plat, "#6366f1")
-
     st.markdown(f"""
-    <div class="rank-card" style="border-left-color: {color};">
-        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
-            <div>
-                <div class="rank-badge rank-{rank}">#{rank}</div>
-            </div>
-            <div style="flex:1; min-width:150px;">
-                <div class="platform-name">{PLATFORM_ICONS.get(plat,'')} {plat.title()}</div>
-            </div>
-            <div style="text-align:right;">
-                <div class="score-label">Overall Score</div>
-                <div class="score-big">{row['overall_score']:.1f}</div>
-            </div>
+    <div class="rank-card" style="border-left-color:{color};">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+        <div><div class="rank-badge rank-{rank}">#{rank}</div></div>
+        <div style="flex:1;min-width:150px;">
+          <div class="platform-name">{PLATFORM_ICONS.get(plat,'')} {plat.title()}</div>
         </div>
-        <div class="metric-row">
-            <div class="metric-pill">
-                <div class="val">{row['avg_delivery']:.1f} min</div>
-                <div class="lbl">Avg Delivery</div>
-            </div>
-            <div class="metric-pill">
-                <div class="val">₹{row['avg_price']:.1f}</div>
-                <div class="lbl">Avg Price</div>
-            </div>
-            <div class="metric-pill">
-                <div class="val">{row['avg_rating']:.2f} ⭐</div>
-                <div class="lbl">Avg Rating</div>
-            </div>
-            <div class="metric-pill">
-                <div class="val">{row['in_stock_pct']:.1f}%</div>
-                <div class="lbl">In Stock</div>
-            </div>
-            <div class="metric-pill">
-                <div class="val">{int(row['total_orders']):,}</div>
-                <div class="lbl">Total Orders</div>
-            </div>
+        <div style="text-align:right;">
+          <div class="score-label">Overall Score</div>
+          <div class="score-big">{row['overall_score']:.1f}</div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+      </div>
+      <div class="metric-row">
+        <div class="metric-pill"><div class="val">{row['avg_delivery']:.1f} min</div><div class="lbl">Avg Delivery</div></div>
+        <div class="metric-pill"><div class="val">₹{row['avg_price']:.1f}</div><div class="lbl">Avg Price</div></div>
+        <div class="metric-pill"><div class="val">{row['avg_rating']:.2f} ⭐</div><div class="lbl">Avg Rating</div></div>
+        <div class="metric-pill"><div class="val">{row['in_stock_pct']:.1f}%</div><div class="lbl">In Stock</div></div>
+        <div class="metric-pill"><div class="val">{int(row['total_orders']):,}</div><div class="lbl">Total Orders</div></div>
+      </div>
+    </div>""", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SCORE BREAKDOWN CHARTS
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown("### 📊 Score Breakdown")
 
-col_left, col_right = st.columns(2)
-
-with col_left:
-    # Radar chart
-    cats_radar = ["Delivery Speed", "Low Price", "Quality / Rating"]
+col_l, col_r = st.columns(2)
+with col_l:
     fig = go.Figure()
     for _, row in scores.iterrows():
         plat = row["platform"]
         fig.add_trace(go.Scatterpolar(
             r=[row["delivery_score"], row["price_score"], row["quality_score"]],
-            theta=cats_radar,
-            fill="toself",
-            name=plat.title(),
-            line_color=PLATFORM_COLORS.get(plat, "#6366f1"),
-            opacity=0.75,
+            theta=["Delivery Speed", "Low Price", "Quality / Rating"],
+            fill="toself", name=plat.title(),
+            line_color=PLATFORM_COLORS.get(plat, "#6366f1"), opacity=0.75,
         ))
     fig.update_layout(
-        polar=dict(
-            bgcolor="rgba(0,0,0,0)",
-            radialaxis=dict(visible=True, range=[0, 100], showticklabels=False),
-        ),
-        title="Platform Strength Radar",
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        height=400,
-        margin=dict(t=50, b=30),
-        legend=dict(orientation="h", y=-0.1),
+        polar=dict(bgcolor="rgba(0,0,0,0)",
+                   radialaxis=dict(visible=True, range=[0,100], showticklabels=False)),
+        title="Platform Strength Radar", template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=400, margin=dict(t=50, b=30), legend=dict(orientation="h", y=-0.1),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-with col_right:
-    # Grouped bar
-    bar_data = []
+with col_r:
+    bar_rows = []
     for _, row in scores.iterrows():
-        plat = row["platform"].title()
-        bar_data.append({"Platform": plat, "Factor": "🚚 Delivery", "Score": row["delivery_score"]})
-        bar_data.append({"Platform": plat, "Factor": "💰 Price", "Score": row["price_score"]})
-        bar_data.append({"Platform": plat, "Factor": "⭐ Quality", "Score": row["quality_score"]})
-    bar_df = pd.DataFrame(bar_data)
-    fig2 = px.bar(
-        bar_df, x="Platform", y="Score", color="Factor",
-        barmode="group", title="Individual Factor Scores",
-        color_discrete_sequence=["#38bdf8", "#34d399", "#f472b6"],
-        template="plotly_dark",
-    )
-    fig2.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        height=400, margin=dict(t=50, b=30),
-        legend=dict(orientation="h", y=-0.15),
-    )
+        p = row["platform"].title()
+        bar_rows += [
+            {"Platform": p, "Factor": "🚚 Delivery", "Score": row["delivery_score"]},
+            {"Platform": p, "Factor": "💰 Price",    "Score": row["price_score"]},
+            {"Platform": p, "Factor": "⭐ Quality",  "Score": row["quality_score"]},
+        ]
+    fig2 = px.bar(pd.DataFrame(bar_rows), x="Platform", y="Score", color="Factor",
+                  barmode="group", title="Individual Factor Scores",
+                  color_discrete_sequence=["#38bdf8","#34d399","#f472b6"],
+                  template="plotly_dark")
+    fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                       height=400, margin=dict(t=50,b=30), legend=dict(orientation="h",y=-0.15))
     st.plotly_chart(fig2, use_container_width=True)
 
-# ─────────────────────────────────────────────
-# DETAILED CATEGORY-LEVEL COMPARISON
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CATEGORY-LEVEL COMPARISON
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown("### 🔍 Category-Level Platform Comparison")
 
-# Use sampled data for faster chart rendering
-cat_platform = filtered_chart.groupby(["category", "platform"]).agg(
-    avg_price=("effective_price", "mean"),
-    avg_delivery=("delivery_minutes", "mean"),
-    avg_rating=("rating", "mean"),
+cat_plat = chart_df.groupby(["category","platform"]).agg(
+    avg_price    = ("effective_price",   "mean"),
+    avg_delivery = ("delivery_minutes",  "mean"),
+    avg_rating   = ("rating",            "mean"),
 ).reset_index()
 
 col_a, col_b = st.columns(2)
-
 with col_a:
-    fig3 = px.bar(
-        cat_platform, x="category", y="avg_price", color="platform",
-        barmode="group", title="Average Price by Category & Platform",
-        color_discrete_map=PLATFORM_COLORS, template="plotly_dark",
-    )
-    fig3.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                       xaxis_tickangle=-45, height=420, margin=dict(t=50, b=80))
-    st.plotly_chart(fig3, use_container_width=True)
+    f3 = px.bar(cat_plat, x="category", y="avg_price", color="platform", barmode="group",
+                title="Avg Price by Category & Platform",
+                color_discrete_map=PLATFORM_COLORS, template="plotly_dark")
+    f3.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                     xaxis_tickangle=-45, height=420, margin=dict(t=50,b=80))
+    st.plotly_chart(f3, use_container_width=True)
 
 with col_b:
-    fig4 = px.bar(
-        cat_platform, x="category", y="avg_delivery", color="platform",
-        barmode="group", title="Average Delivery Time by Category & Platform",
-        color_discrete_map=PLATFORM_COLORS, template="plotly_dark",
-    )
-    fig4.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                       xaxis_tickangle=-45, height=420, margin=dict(t=50, b=80))
-    st.plotly_chart(fig4, use_container_width=True)
+    f4 = px.bar(cat_plat, x="category", y="avg_delivery", color="platform", barmode="group",
+                title="Avg Delivery Time by Category & Platform",
+                color_discrete_map=PLATFORM_COLORS, template="plotly_dark")
+    f4.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                     xaxis_tickangle=-45, height=420, margin=dict(t=50,b=80))
+    st.plotly_chart(f4, use_container_width=True)
 
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PRODUCT-LEVEL TABLE
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown("### 📋 Product-Level Platform Metrics")
 
-# Use sampled data for faster rendering
-product_plat = filtered_chart.groupby(["product_name", "category", "platform"]).agg(
-    avg_price=("effective_price", "mean"),
-    avg_delivery=("delivery_minutes", "mean"),
-    avg_rating=("rating", "mean"),
-    in_stock_pct=("in_stock", "mean"),
-).reset_index()
-product_plat["in_stock_pct"] = (product_plat["in_stock_pct"] * 100).round(1)
-product_plat["avg_price"] = product_plat["avg_price"].round(2)
-product_plat["avg_delivery"] = product_plat["avg_delivery"].round(1)
-product_plat["avg_rating"] = product_plat["avg_rating"].round(2)
+prod_plat = (chart_df
+    .groupby(["product_name","category","platform"])
+    .agg(avg_price=("effective_price","mean"), avg_delivery=("delivery_minutes","mean"),
+         avg_rating=("rating","mean"), in_stock_pct=("in_stock","mean"))
+    .reset_index()
+)
+prod_plat["in_stock_pct"]  = (prod_plat["in_stock_pct"] * 100).round(1)
+prod_plat["avg_price"]     = prod_plat["avg_price"].round(2)
+prod_plat["avg_delivery"]  = prod_plat["avg_delivery"].round(1)
+prod_plat["avg_rating"]    = prod_plat["avg_rating"].round(2)
 
 st.dataframe(
-    product_plat.rename(columns={
-        "product_name": "Product",
-        "category": "Category",
-        "platform": "Platform",
-        "avg_price": "Avg Price (₹)",
-        "avg_delivery": "Delivery (min)",
-        "avg_rating": "Rating ⭐",
-        "in_stock_pct": "In Stock %",
+    prod_plat.rename(columns={
+        "product_name": "Product", "category": "Category", "platform": "Platform",
+        "avg_price": "Avg Price (₹)", "avg_delivery": "Delivery (min)",
+        "avg_rating": "Rating ⭐", "in_stock_pct": "In Stock %",
     }),
-    use_container_width=True,
-    height=400,
+    use_container_width=True, height=400,
 )
 
-# ─────────────────────────────────────────────
-# SMART INSIGHT
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INSIGHT BOX
+# ═════════════════════════════════════════════════════════════════════════════
+
 best = scores.iloc[0]
+label = "products" if selected_prods else "categories"
 st.markdown(f"""
 <div class="insight-box">
-    <div class="title">💡 Recommendation Insight</div>
-    <div class="text">
-        Based on your preference weights (Delivery: <b>{w_delivery}</b>, Price: <b>{w_price}</b>,
-        Quality: <b>{w_quality}</b>), <b>{best['platform'].title()}</b> is your best pick
-        with an overall score of <b>{best['overall_score']:.1f}/100</b>.<br>
-        It delivers in ~<b>{best['avg_delivery']:.0f} min</b> on average at
-        <b>₹{best['avg_price']:.0f}</b> avg price with a <b>{best['avg_rating']:.2f}⭐</b> rating
-        across your selected {'products' if selected_products else 'categories'}.
-    </div>
-</div>
-""", unsafe_allow_html=True)
+  <div class="title">💡 Recommendation Insight</div>
+  <div class="text">
+    Based on your weights (Delivery <b>{w_delivery}</b> · Price <b>{w_price}</b> ·
+    Quality <b>{w_quality}</b>), <b>{best['platform'].title()}</b> is your best pick
+    with a score of <b>{best['overall_score']:.1f}/100</b>.<br>
+    Delivers in ~<b>{best['avg_delivery']:.0f} min</b> · avg price
+    <b>₹{best['avg_price']:.0f}</b> · rating <b>{best['avg_rating']:.2f}⭐</b>
+    across your selected {label}.
+  </div>
+</div>""", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# DEMAND FORECASTING (GBT Model)
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DEMAND FORECASTING  (GBT)
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown("### 🤖 Demand Forecasting — GBT Model")
 
-demand_df = load_demand_forecasts(cats_tuple, prods_tuple, max_rows=80_000)
-if demand_df is not None:
-    # Filter by selected categories and products
-    if selected_categories:
-        demand_filtered = demand_df[demand_df["category"].isin(selected_categories)].copy()
-    else:
-        demand_filtered = demand_df.copy()
+demand_df = None if USING_DEMO else load_demand(cats_t, prods_t)
 
-    if selected_products:
-        demand_filtered = demand_filtered[demand_filtered["product_name"].isin(selected_products)]
+if demand_df is not None and not demand_df.empty:
+    if selected_cats:  demand_df = demand_df[demand_df["category"    ].isin(selected_cats )]
+    if selected_prods: demand_df = demand_df[demand_df["product_name"].isin(selected_prods)]
+    if len(demand_df) > 50_000:
+        demand_df = demand_df.sample(50_000, random_state=42)
 
-    # Sample demand data to prevent memory overload (14M → 50K rows)
-    if len(demand_filtered) > 50000:
-        demand_filtered = demand_filtered.sample(n=50000, random_state=42)
-        debug_log(f"Sampled demand data to 50K rows for visualization")
+    plat_score_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
+    demand_df = demand_df.copy()
+    demand_df["pref_mul"]        = demand_df["platform"].map(plat_score_map).fillna(0.5)
+    demand_df["adj_predicted"]   = demand_df["predicted_demand"] * demand_df["pref_mul"]
 
-    # Dynamic Weighting: Adjust predictions based on user's slider preferences (via platform scores)
-    platform_scores_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
-    demand_filtered["preference_multiplier"] = demand_filtered["platform"].map(platform_scores_map).fillna(0.5)
-    demand_filtered["adj_predicted_demand"] = demand_filtered["predicted_demand"] * demand_filtered["preference_multiplier"]
+    st.markdown("""
+    <div class="insight-box">
+      <div class="title">🌲 GBT Regressor — Model Info</div>
+      <div class="text">
+        <b>Type:</b> Gradient-Boosted Trees (Spark MLlib) &nbsp;|&nbsp;
+        <b>Trees:</b> 15 &nbsp;|&nbsp; <b>Max Depth:</b> 4 &nbsp;|&nbsp; <b>Features:</b> 6<br>
+        <b>Columns:</b> platform_idx, category_idx, weather_idx, is_raining_int, in_stock_int, stock_remaining
+      </div>
+    </div>""", unsafe_allow_html=True)
 
-    if not demand_filtered.empty:
-        # Hardcoded Model Info for GBT Regressor
-        n_trees = 15
-        n_features = 6
-        max_depth = 4
-        feature_list = ["platform_idx", "category_idx", "weather_idx", "is_raining_int", "in_stock_int", "stock_remaining"]
+    dagg = demand_df.groupby("platform").agg(
+        avg_actual    = ("units_ordered",   "mean"),
+        avg_adj_pred  = ("adj_predicted",   "mean"),
+    ).reset_index()
 
-        st.markdown(f"""
-        <div class="insight-box">
-            <div class="title">🌲 Model Architecture — GBT Regressor</div>
-            <div class="text">
-                <b>Type:</b> Gradient-Boosted Trees (Spark MLlib) &nbsp;|&nbsp;
-                <b>Trees:</b> {n_trees} &nbsp;|&nbsp;
-                <b>Max Depth:</b> {max_depth} &nbsp;|&nbsp;
-                <b>Features:</b> {n_features} &nbsp;|&nbsp;
-                <b>Target:</b> units_ordered<br>
-                <b>Feature columns:</b> {', '.join(feature_list)}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        fd1 = go.Figure()
+        fd1.add_trace(go.Bar(x=dagg["platform"].str.title(), y=dagg["avg_actual"],
+                             name="Actual Demand", marker_color="#38bdf8"))
+        fd1.add_trace(go.Bar(x=dagg["platform"].str.title(), y=dagg["avg_adj_pred"],
+                             name="Adjusted Prediction", marker_color="#a78bfa"))
+        fd1.update_layout(title="Avg Demand: Actual vs Predicted", barmode="group",
+                          template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)", height=400,
+                          legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fd1, use_container_width=True)
 
-        # Actual vs Predicted by platform
-        demand_agg = demand_filtered.groupby("platform").agg(
-            avg_actual=("units_ordered", "mean"),
-            avg_predicted=("predicted_demand", "mean"),
-            avg_adj_predicted=("adj_predicted_demand", "mean"),
-            total_actual=("units_ordered", "sum"),
-            total_predicted=("predicted_demand", "sum"),
-        ).reset_index()
+    with col_d2:
+        top_prods = (demand_df.groupby("product_name")
+                    .agg(avg_adj_pred=("adj_predicted","mean"), avg_actual=("units_ordered","mean"))
+                    .reset_index().nlargest(15,"avg_adj_pred"))
+        fd2 = go.Figure()
+        fd2.add_trace(go.Bar(y=top_prods["product_name"], x=top_prods["avg_actual"],
+                             name="Actual", orientation="h", marker_color="#38bdf8"))
+        fd2.add_trace(go.Bar(y=top_prods["product_name"], x=top_prods["avg_adj_pred"],
+                             name="Adjusted Predicted", orientation="h", marker_color="#a78bfa"))
+        fd2.update_layout(title="Top 15 Products by Weighted Demand", barmode="group",
+                          template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)", height=400,
+                          legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fd2, use_container_width=True)
 
-        col_d1, col_d2 = st.columns(2)
-
-        with col_d1:
-            fig_d1 = go.Figure()
-            fig_d1.add_trace(go.Bar(
-                x=demand_agg["platform"].str.title(), y=demand_agg["avg_actual"],
-                name="Actual Demand", marker_color="#38bdf8",
-            ))
-            fig_d1.add_trace(go.Bar(
-                x=demand_agg["platform"].str.title(), y=demand_agg["avg_adj_predicted"],
-                name="Slider-Adjusted Prediction", marker_color="#a78bfa",
-            ))
-            fig_d1.update_layout(
-                title="Avg Demand: Actual vs Predicted", barmode="group",
-                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)", height=400,
-                legend=dict(orientation="h", y=-0.15),
-            )
-            st.plotly_chart(fig_d1, use_container_width=True)
-
-        with col_d2:
-            # Demand by product (top 15)
-            prod_demand = demand_filtered.groupby("product_name").agg(
-                avg_predicted=("adj_predicted_demand", "mean"),
-                avg_actual=("units_ordered", "mean"),
-            ).reset_index().nlargest(15, "avg_predicted")
-
-            fig_d2 = go.Figure()
-            fig_d2.add_trace(go.Bar(
-                y=prod_demand["product_name"], x=prod_demand["avg_actual"],
-                name="Actual", orientation="h", marker_color="#38bdf8",
-            ))
-            fig_d2.add_trace(go.Bar(
-                y=prod_demand["product_name"], x=prod_demand["avg_predicted"],
-                name="Adjusted Predicted", orientation="h", marker_color="#a78bfa",
-            ))
-            fig_d2.update_layout(
-                title="Top Products by Preference-Weighted Demand", barmode="group",
-                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)", height=400,
-                legend=dict(orientation="h", y=-0.15),
-            )
-            st.plotly_chart(fig_d2, use_container_width=True)
-
-        # Demand by category heatmap
-        cat_plat_demand = demand_filtered.groupby(["category", "platform"])["adj_predicted_demand"].mean().reset_index()
-        pivot = cat_plat_demand.pivot(index="category", columns="platform", values="adj_predicted_demand").fillna(0)
-        fig_heat = px.imshow(
-            pivot.values, x=pivot.columns.str.title(), y=pivot.index,
-            color_continuous_scale="Viridis", aspect="auto",
-            title="Slider-Adjusted Demand Heatmap (Category × Platform)",
-            labels={"color": "Adj Demand"},
-        )
-        fig_heat.update_layout(
-            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)", height=380,
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
-    else:
-        st.info("No demand forecast data for selected products.")
+    pivot = (demand_df.groupby(["category","platform"])["adj_predicted"].mean()
+             .reset_index()
+             .pivot(index="category", columns="platform", values="adj_predicted")
+             .fillna(0))
+    fheat = px.imshow(pivot.values, x=pivot.columns.str.title(), y=pivot.index,
+                      color_continuous_scale="Viridis", aspect="auto",
+                      title="Adjusted Demand Heatmap (Category × Platform)",
+                      labels={"color":"Adj Demand"})
+    fheat.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)", height=380)
+    st.plotly_chart(fheat, use_container_width=True)
 else:
-    st.warning("Demand forecast data not found. Run `ml_pipeline.py` to generate it.")
+    st.info("Demand forecast data not available. Run `ml_pipeline.py` to generate `demand_forecasts.parquet`.")
 
-# ─────────────────────────────────────────────
-# TREND ANALYSIS (RF Model)
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TREND ANALYSIS  (RF)
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown("### 📈 Trend Analysis — Random Forest Classifier")
 
-trend_df = load_trend_labels(cats_tuple, prods_tuple, max_rows=80_000)
-if trend_df is not None:
-    # Filter by selected categories and products
-    if selected_categories:
-        trend_filtered = trend_df[trend_df["category"].isin(selected_categories)].copy()
-    else:
-        trend_filtered = trend_df.copy()
+trend_df = None if USING_DEMO else load_trends(cats_t, prods_t)
 
-    if selected_products:
-        trend_filtered = trend_filtered[trend_filtered["product_name"].isin(selected_products)]
+TREND_MAP = {0: "stable", 1: "declining", 2: "trending"}
+COLOR_MAP  = {"stable": "#34d399", "trending": "#f472b6", "declining": "#fb923c"}
 
-    # Sample trend data to prevent memory overload (14M → 50K rows)
-    if len(trend_filtered) > 50000:
-        trend_filtered = trend_filtered.sample(n=50000, random_state=42)
-        debug_log(f"Sampled trend data to 50K rows for visualization")
+if trend_df is not None and not trend_df.empty:
+    if selected_cats:  trend_df = trend_df[trend_df["category"    ].isin(selected_cats )]
+    if selected_prods: trend_df = trend_df[trend_df["product_name"].isin(selected_prods)]
+    if len(trend_df) > 50_000:
+        trend_df = trend_df.sample(50_000, random_state=42)
 
-    # Dynamic Weighting: Adjust trend strength based on slider preferences
-    platform_scores_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
-    trend_filtered["preference_multiplier"] = trend_filtered["platform"].map(platform_scores_map).fillna(0.5)
-    trend_filtered["adj_daily_demand"] = trend_filtered["daily_demand"] * trend_filtered["preference_multiplier"]
-    trend_filtered["adj_rolling_7d"] = trend_filtered["rolling_avg_7d"] * trend_filtered["preference_multiplier"]
+    plat_score_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
+    trend_df = trend_df.copy()
+    trend_df["pref_mul"]        = trend_df["platform"].map(plat_score_map).fillna(0.5)
+    trend_df["adj_daily"]       = trend_df["daily_demand"]    * trend_df["pref_mul"]
+    trend_df["adj_rolling"]     = trend_df["rolling_avg_7d"]  * trend_df["pref_mul"]
+    trend_df["predicted_trend"] = trend_df["predicted_label_idx"].map(TREND_MAP).fillna("unknown")
 
-    if not trend_filtered.empty:
-        # Hardcoded Model Info for Random Forest Classifier
-        rf_trees = 30
-        rf_classes = 3
-        rf_depth = 6
-        rf_features = ["platform_idx", "category_idx", "month", "daily_demand", "daily_avg_price", "rolling_avg_7d"]
-        
-        # Label mapping from first stage (StringIndexer on trend_label)
-        trend_label_map = {0: "stable", 1: "declining", 2: "trending"}
+    st.markdown("""
+    <div class="insight-box">
+      <div class="title">🌳 Random Forest Classifier — Model Info</div>
+      <div class="text">
+        <b>Type:</b> Random Forest (Spark MLlib) &nbsp;|&nbsp;
+        <b>Trees:</b> 30 &nbsp;|&nbsp; <b>Max Depth:</b> 6 &nbsp;|&nbsp;
+        <b>Classes:</b> 3 (stable · declining · trending)<br>
+        <b>Columns:</b> platform_idx, category_idx, month, daily_demand, daily_avg_price, rolling_avg_7d
+      </div>
+    </div>""", unsafe_allow_html=True)
 
-        st.markdown(f"""
-        <div class="insight-box">
-            <div class="title">🌳 Model Architecture — Random Forest Classifier</div>
-            <div class="text">
-                <b>Type:</b> Random Forest (Spark MLlib) &nbsp;|&nbsp;
-                <b>Trees:</b> {rf_trees} &nbsp;|&nbsp;
-                <b>Max Depth:</b> {rf_depth} &nbsp;|&nbsp;
-                <b>Classes:</b> {rf_classes} (stable, declining, trending) &nbsp;|&nbsp;
-                <b>Features:</b> {len(rf_features)}<br>
-                <b>Feature columns:</b> {', '.join(rf_features)}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        tc = trend_df["trend_label"].value_counts().reset_index()
+        tc.columns = ["Trend","Count"]
+        ft1 = px.pie(tc, values="Count", names="Trend", title="Actual Trend Distribution",
+                     color="Trend", color_discrete_map=COLOR_MAP)
+        ft1.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", height=380)
+        st.plotly_chart(ft1, use_container_width=True)
 
-        # Map predicted index to label
-        trend_filtered = trend_filtered.copy()
-        trend_filtered["predicted_trend"] = trend_filtered["predicted_label_idx"].map(trend_label_map).fillna("unknown")
+    with col_t2:
+        pc = trend_df["predicted_trend"].value_counts().reset_index()
+        pc.columns = ["Trend","Count"]
+        ft2 = px.pie(pc, values="Count", names="Trend", title="Predicted Trend Distribution",
+                     color="Trend", color_discrete_map=COLOR_MAP)
+        ft2.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", height=380)
+        st.plotly_chart(ft2, use_container_width=True)
 
-        col_t1, col_t2 = st.columns(2)
-
-        with col_t1:
-            # Actual trend distribution
-            trend_counts = trend_filtered["trend_label"].value_counts().reset_index()
-            trend_counts.columns = ["Trend", "Count"]
-            color_map = {"stable": "#34d399", "trending": "#f472b6", "declining": "#fb923c"}
-            fig_t1 = px.pie(
-                trend_counts, values="Count", names="Trend",
-                title="Actual Trend Distribution",
-                color="Trend", color_discrete_map=color_map,
-            )
-            fig_t1.update_layout(
-                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                height=380,
-            )
-            st.plotly_chart(fig_t1, use_container_width=True)
-
-        with col_t2:
-            # Predicted trend distribution
-            pred_counts = trend_filtered["predicted_trend"].value_counts().reset_index()
-            pred_counts.columns = ["Trend", "Count"]
-            fig_t2 = px.pie(
-                pred_counts, values="Count", names="Trend",
-                title="Predicted Trend Distribution",
-                color="Trend", color_discrete_map=color_map,
-            )
-            fig_t2.update_layout(
-                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                height=380,
-            )
-            st.plotly_chart(fig_t2, use_container_width=True)
-
-
-
-        # Trending products table
-        st.markdown("#### 🔥 Top Trending Products (Weighted by Preferences)")
-        trending_prods = (
-            trend_filtered[trend_filtered["trend_label"] == "trending"]
-            .groupby(["product_name", "category", "platform"])
-            .agg(avg_daily_demand=("adj_daily_demand", "mean"), rolling_7d=("adj_rolling_7d", "mean"))
-            .reset_index()
-            .sort_values("avg_daily_demand", ascending=False)
+    st.markdown("#### 🔥 Top Trending Products (Preference-Weighted)")
+    trending = (trend_df[trend_df["trend_label"] == "trending"]
+                .groupby(["product_name","category","platform"])
+                .agg(avg_daily=("adj_daily","mean"), rolling_7d=("adj_rolling","mean"))
+                .reset_index()
+                .sort_values("avg_daily", ascending=False))
+    if not trending.empty:
+        trending["avg_daily"]  = trending["avg_daily"].round(1)
+        trending["rolling_7d"] = trending["rolling_7d"].round(1)
+        st.dataframe(
+            trending.rename(columns={
+                "product_name": "Product", "category": "Category", "platform": "Platform",
+                "avg_daily": "Adj Daily Demand", "rolling_7d": "Adj 7-Day Rolling",
+            }),
+            use_container_width=True, height=300,
         )
-        if not trending_prods.empty:
-            trending_prods["avg_daily_demand"] = trending_prods["avg_daily_demand"].round(1)
-            trending_prods["rolling_7d"] = trending_prods["rolling_7d"].round(1)
-            st.dataframe(
-                trending_prods.rename(columns={
-                    "product_name": "Product", "category": "Category",
-                    "platform": "Platform", "avg_daily_demand": "Adj Daily Demand",
-                    "rolling_7d": "Adj 7-Day Rolling",
-                }),
-                use_container_width=True, height=300,
-            )
-        else:
-            st.info("No trending products found in the selected data.")
     else:
-        st.info("No trend data for selected products.")
+        st.info("No trending products in the selected data.")
 else:
-    st.warning("Trend labels data not found. Run `ml_pipeline.py` to generate it.")
+    st.info("Trend label data not available. Run `ml_pipeline.py` to generate `trend_labels.parquet`.")
 
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
 # FOOTER
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown(f"""
-<div style='text-align:center; color:#64748b; font-size:0.85rem;'>
-    QuickCommerce Platform Recommender &bull; Last refreshed: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    &bull; Data: Blinkit · Zepto · Swiggy Instamart
-    &bull; Models: GBT Demand Forecaster + RF Trend Classifier
-</div>
-""", unsafe_allow_html=True)
+<div style='text-align:center;color:#64748b;font-size:.85rem;'>
+  QuickCommerce Platform Recommender &bull;
+  Refreshed: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} &bull;
+  Data: Blinkit · Zepto · Swiggy Instamart &bull;
+  Models: GBT Demand Forecaster + RF Trend Classifier
+  {"&bull; <b>⚠️ DEMO MODE</b>" if USING_DEMO else ""}
+</div>""", unsafe_allow_html=True)
 
-# Debug: App loaded successfully
-debug_log("✅ App rendered successfully!")
+dbg("✅ App rendered successfully")

@@ -396,6 +396,9 @@ DEMAND_COLS = ("platform", "category", "product_name",
 TREND_COLS  = ("platform", "category", "product_name", "date",
                "daily_demand", "rolling_avg_7d",
                "trend_label", "predicted_label_idx")
+TREND_COLS_ALT = ("platform", "category", "product_name", "date",
+                  "daily_demand", "rolling_avg_7d",
+                  "trend_label", "predicted_trend_idx")
 
 
 def load_unified(cats, prods, max_rows):
@@ -407,8 +410,17 @@ def load_demand_forecasts(cats=None, prods=None, max_rows=80_000):
                            filter_categories=cats, filter_products=prods)
 
 def load_trend_labels(cats=None, prods=None, max_rows=80_000):
-    return _stream_parquet(TREND_LABELS, TREND_COLS, max_rows,
-                           filter_categories=cats, filter_products=prods)
+    df = _stream_parquet(TREND_LABELS, TREND_COLS, max_rows,
+                         filter_categories=cats, filter_products=prods)
+    if df is not None:
+        return df
+
+    # Backward compatibility for pipeline outputs that use predicted_trend_idx.
+    df_alt = _stream_parquet(TREND_LABELS, TREND_COLS_ALT, max_rows,
+                             filter_categories=cats, filter_products=prods)
+    if df_alt is not None and "predicted_trend_idx" in df_alt.columns:
+        df_alt = df_alt.rename(columns={"predicted_trend_idx": "predicted_label_idx"})
+    return df_alt
 
 
 # ═════════════════════════════════════════════════════════════════════════════

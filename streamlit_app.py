@@ -29,9 +29,11 @@ os.environ.setdefault("AWS_DEFAULT_REGION", "eu-north-1")
 try:
     import pyarrow.parquet as pq
     import pyarrow.fs      as pafs
+    import pyarrow.dataset as pad   # for exclude_invalid_files on Spark folders
 except ImportError:
     pq   = None
     pafs = None
+    pad  = None
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
 DEBUG = True
@@ -131,21 +133,24 @@ def _pq_path(path: str):
 
 def _file_is_valid(path: str) -> bool:
     """
-    Return True only if the parquet file exists AND is non-empty.
-    This is the guard that prevents the 0-byte crash.
+    Return True if the path points to a readable parquet dataset —
+    either a single .parquet file or a Spark-partitioned folder like
+    unified.parquet/ containing part-NNNNN-tid-<uuid>.c000.snappy.parquet files.
+
+    Uses pyarrow.dataset with exclude_invalid_files so _SUCCESS and
+    _committed_ Spark metadata files are ignored automatically.
     """
-    if pq is None or pafs is None:
+    if pad is None or pafs is None:
         return False
     try:
         fs, bare = _pq_path(path)
-        info = fs.get_file_info(bare) if fs else None
-        if info is None:
-            # local file
-            return os.path.isfile(bare) and os.path.getsize(bare) > 0
-        # S3: FileType.File == 2 in pyarrow ≥ 12
-        return info.type.value == 2 and (info.size or 0) > 0
+        ds = pad.dataset(bare, filesystem=fs, format="parquet",
+                         exclude_invalid_files=True)
+        # get_fragments() is lazy — it just lists matching files
+        frags = list(ds.get_fragments())
+        return len(frags) > 0
     except Exception as e:
-        dbg(f"_file_is_valid({path}): {e}")
+        dbg(f"_file_is_valid({path}): {type(e).__name__}: {e}")
         return False
 
 
@@ -190,10 +195,16 @@ def _stream_parquet(
     chunks, collected, scanned = [], 0, 0
     try:
         fs, bare = _pq_path(path)
-        pf = pq.ParquetFile(bare, filesystem=fs)
-        for batch in pf.iter_batches(batch_size=batch_size, columns=list(columns), use_threads=True):
+        # ParquetDataset handles both single files AND partitioned directories.
+        # We pass the dataset to iter_batches via a Scanner for memory efficiency.
+        # pyarrow.dataset handles Spark folders with _SUCCESS / metadata files cleanly
+        dataset = pad.dataset(bare, filesystem=fs, format="parquet",
+                              exclude_invalid_files=True)
+        scanner = dataset.scanner(columns=list(columns), batch_size=batch_size)
+        for batch in scanner.to_batches():
             scanned += batch.num_rows
-            dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
+            # RecordBatch.to_pandas does not accept use_threads
+            dfb = batch.to_pandas(strings_to_categorical=True)
 
             if cats_set  and "category"     in dfb.columns: dfb = dfb[dfb["category"    ].isin(cats_set )]
             if prods_set and "product_name" in dfb.columns: dfb = dfb[dfb["product_name"].isin(prods_set)]
@@ -251,10 +262,12 @@ def build_catalog(scan_rows: int = 200_000) -> Optional[dict]:
 
     try:
         fs, bare = _pq_path(UNIFIED_PARQUET)
-        pf = pq.ParquetFile(bare, filesystem=fs)
-        for batch in pf.iter_batches(batch_size=65_536, columns=list(cols), use_threads=True):
+        dataset = pad.dataset(bare, filesystem=fs, format="parquet",
+                              exclude_invalid_files=True)
+        scanner = dataset.scanner(columns=list(cols), batch_size=65_536)
+        for batch in scanner.to_batches():
             scanned += batch.num_rows
-            dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
+            dfb = batch.to_pandas(strings_to_categorical=True)
             dfb = dfb.dropna(subset=["category", "product_name"])
             if dfb.empty:
                 if scanned >= scan_rows: break

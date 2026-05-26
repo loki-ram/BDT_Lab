@@ -16,6 +16,13 @@ import json
 import glob
 import sys
 import s3fs
+from collections import Counter, defaultdict
+from typing import Optional, Sequence, Tuple
+
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover
+    pq = None
 
 # Set S3 region and configuration BEFORE any S3 operations
 # Set S3 timeouts and region BEFORE any S3 operations
@@ -192,6 +199,11 @@ def load_unified():
                 storage_options={"anon": False}
             )
             df["snapshot_time"] = pd.to_datetime(df["snapshot_time"])
+            
+            # Massive memory optimization: Convert object columns to categoricals
+            for col in ["platform", "category", "product_name"]:
+                df[col] = df[col].astype("category")
+                
         debug_log(f"✅ Loaded unified data: {df.shape[0]} rows × {df.shape[1]} cols (memory optimized)")
         return df
     except TimeoutError as e:
@@ -217,6 +229,12 @@ def load_demand_forecasts():
             columns=columns_needed,
             storage_options={"anon": False}
         )
+        
+        # Categorical memory optimization
+        for col in ["platform", "category", "product_name"]:
+            if col in df.columns:
+                df[col] = df[col].astype("category")
+                
         debug_log(f"✅ Loaded demand forecasts: {df.shape[0]} rows (memory optimized)")
         return df
     except Exception as e:
@@ -239,6 +257,12 @@ def load_trend_labels():
             storage_options={"anon": False}
         )
         df["date"] = pd.to_datetime(df["date"])
+        
+        # Categorical memory optimization
+        for col in ["platform", "category", "product_name", "trend_label"]:
+            if col in df.columns:
+                df[col] = df[col].astype("category")
+                
         debug_log(f"✅ Loaded trend labels: {df.shape[0]} rows (memory optimized)")
         return df
     except Exception as e:
@@ -248,6 +272,216 @@ def load_trend_labels():
 # ─────────────────────────────────────────────
 # SCORING LOGIC
 # ─────────────────────────────────────────────
+@st.cache_resource
+def _s3_filesystem():
+    # Reuse the same S3 client across reruns.
+    return s3fs.S3FileSystem(anon=False)
+
+
+def _open_parquet(path: str):
+    if path.startswith("s3://"):
+        # s3fs expects "bucket/key" (without the "s3://" prefix).
+        return _s3_filesystem().open(path.replace("s3://", "", 1), "rb")
+    return open(path, "rb")
+
+
+def _ensure_pyarrow():
+    if pq is None:
+        st.error("pyarrow is required for streaming Parquet reads. Please add `pyarrow` to your requirements.")
+        st.stop()
+
+
+@st.cache_data(ttl=3600, max_entries=20)
+def _load_parquet_sample(
+    path: str,
+    columns: Sequence[str],
+    max_rows: int,
+    categories: Optional[Tuple[str, ...]] = None,
+    products: Optional[Tuple[str, ...]] = None,
+    seed: int = 42,
+    batch_size: int = 65536,
+):
+    """
+    Stream Parquet in batches and keep at most `max_rows` rows in memory.
+
+    The goal is bounded memory + "enough" data for stable charts on small EC2 instances.
+    """
+    _ensure_pyarrow()
+
+    categories_set = set(categories or ())
+    products_set = set(products or ())
+    rng = np.random.default_rng(seed)
+
+    rows_collected = 0
+    scanned_rows = 0
+    # With no filters, don't scan the entire file: read a bounded prefix.
+    scan_row_budget = max(500_000, max_rows * 20) if (not categories_set and not products_set) else max(2_000_000, max_rows * 60)
+
+    chunks = []
+    try:
+        with _open_parquet(path) as f:
+            pf = pq.ParquetFile(f)
+            for batch in pf.iter_batches(batch_size=batch_size, columns=list(columns), use_threads=True):
+                scanned_rows += batch.num_rows
+                dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
+
+                if categories_set and "category" in dfb.columns:
+                    dfb = dfb[dfb["category"].isin(categories_set)]
+                if products_set and "product_name" in dfb.columns:
+                    dfb = dfb[dfb["product_name"].isin(products_set)]
+
+                if dfb.empty:
+                    if scanned_rows >= scan_row_budget:
+                        break
+                    continue
+
+                remaining = max_rows - rows_collected
+                if remaining <= 0:
+                    break
+
+                # Broad scan: take a small number of rows per batch to keep sampling spread out.
+                if not categories_set and not products_set:
+                    per_batch_cap = max(2_000, max_rows // 50)
+                    take_n = min(len(dfb), per_batch_cap, remaining)
+                else:
+                    take_n = min(len(dfb), remaining)
+
+                if take_n < len(dfb):
+                    dfb = dfb.sample(n=take_n, random_state=int(rng.integers(0, 2**31 - 1)), ignore_index=True)
+                else:
+                    dfb = dfb.reset_index(drop=True)
+
+                chunks.append(dfb)
+                rows_collected += len(dfb)
+
+                if rows_collected >= max_rows or scanned_rows >= scan_row_budget:
+                    break
+
+        if not chunks:
+            return pd.DataFrame(columns=list(columns))
+
+        df = pd.concat(chunks, ignore_index=True)
+        if "snapshot_time" in df.columns:
+            df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce")
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df
+    except TimeoutError as e:
+        debug_log(f"⏱️  S3 timeout while reading {path}: {e}")
+        return None
+    except Exception as e:
+        debug_log(f"❌ Parquet streaming read failed for {path}: {type(e).__name__}: {str(e)[:200]}")
+        return None
+
+
+@st.cache_data(ttl=3600, max_entries=2)
+def load_unified_catalog(scan_rows: int = 400_000, max_products_total: int = 5000, max_products_per_cat: int = 1500):
+    """
+    Build a lightweight catalog for sidebar widgets without loading the full unified parquet.
+    We scan only a bounded number of rows and keep the most common products.
+    """
+    _ensure_pyarrow()
+
+    columns = ["category", "product_name", "units_ordered"]
+    categories = set()
+    product_counts = Counter()
+    per_cat_counts = defaultdict(Counter)
+    scanned = 0
+
+    try:
+        with _open_parquet(UNIFIED_PARQUET) as f:
+            pf = pq.ParquetFile(f)
+            for batch in pf.iter_batches(batch_size=65536, columns=columns, use_threads=True):
+                scanned += batch.num_rows
+                dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
+                dfb = dfb.dropna(subset=["category", "product_name"])
+                if dfb.empty:
+                    if scanned >= scan_rows:
+                        break
+                    continue
+
+                categories.update(dfb["category"].unique().tolist())
+
+                # Prefer units_ordered as a proxy for "popular products", fallback to frequency.
+                if "units_ordered" in dfb.columns and pd.api.types.is_numeric_dtype(dfb["units_ordered"]):
+                    prod_sum = dfb.groupby("product_name")["units_ordered"].sum()
+                    for k, v in prod_sum.items():
+                        product_counts[k] += float(v)
+
+                    cat_prod_sum = dfb.groupby(["category", "product_name"])["units_ordered"].sum()
+                    for (cat, prod), v in cat_prod_sum.items():
+                        per_cat_counts[cat][prod] += float(v)
+                else:
+                    vc = dfb["product_name"].value_counts()
+                    for k, v in vc.items():
+                        product_counts[k] += int(v)
+                    for cat, sub in dfb.groupby("category"):
+                        vc2 = sub["product_name"].value_counts()
+                        for k, v in vc2.items():
+                            per_cat_counts[cat][k] += int(v)
+
+                if scanned >= scan_rows:
+                    break
+
+        cat_list = sorted([c for c in categories if c is not None])
+        top_products = [p for p, _ in product_counts.most_common(max_products_total)]
+        products_by_category = {cat: [p for p, _ in cnt.most_common(max_products_per_cat)] for cat, cnt in per_cat_counts.items()}
+        return {"categories": cat_list, "top_products": top_products, "products_by_category": products_by_category}
+    except Exception as e:
+        debug_log(f"⚠️  Could not build catalog: {type(e).__name__}: {str(e)[:200]}")
+        return None
+
+
+@st.cache_data(ttl=3600, max_entries=10)
+def load_unified_sample(categories: Optional[Tuple[str, ...]], products: Optional[Tuple[str, ...]], max_rows: int, seed: int = 42):
+    columns_needed = [
+        "platform",
+        "category",
+        "product_name",
+        "delivery_minutes",
+        "effective_price",
+        "rating",
+        "units_ordered",
+        "stock_remaining",
+        "in_stock",
+        "snapshot_time",
+    ]
+    return _load_parquet_sample(
+        UNIFIED_PARQUET,
+        columns=columns_needed,
+        max_rows=max_rows,
+        categories=categories,
+        products=products,
+        seed=seed,
+    )
+
+
+@st.cache_data(ttl=3600, max_entries=10)
+def load_demand_forecasts(categories: Optional[Tuple[str, ...]] = None, products: Optional[Tuple[str, ...]] = None, max_rows: int = 80_000):
+    columns_needed = ["platform", "category", "product_name", "predicted_demand", "units_ordered"]
+    return _load_parquet_sample(
+        DEMAND_FORECASTS,
+        columns=columns_needed,
+        max_rows=max_rows,
+        categories=categories,
+        products=products,
+        seed=42,
+    )
+
+
+@st.cache_data(ttl=3600, max_entries=10)
+def load_trend_labels(categories: Optional[Tuple[str, ...]] = None, products: Optional[Tuple[str, ...]] = None, max_rows: int = 80_000):
+    columns_needed = ["platform", "category", "product_name", "date", "daily_demand", "rolling_avg_7d", "trend_label", "predicted_label_idx"]
+    return _load_parquet_sample(
+        TREND_LABELS,
+        columns=columns_needed,
+        max_rows=max_rows,
+        categories=categories,
+        products=products,
+        seed=42,
+    )
+
+
 def compute_platform_scores(df, w_delivery, w_price, w_quality):
     """
     For each platform compute normalised scores for delivery, price and quality,
@@ -295,12 +529,12 @@ def compute_platform_scores(df, w_delivery, w_price, w_quality):
 # ─────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────
-debug_log("Attempting to load main dataset...")
+debug_log("Attempting to load sidebar catalog...")
 
 with st.spinner("⏳ Initializing app and loading data from S3..."):
-    unified_df = load_unified()
+    catalog = load_unified_catalog()
 
-if unified_df is None:
+if not catalog or not catalog.get("categories"):
     st.markdown("""
     <div style="background: #fee2e2; border: 1px solid #fca5a5; border-radius: 8px; padding: 16px; margin: 16px 0;">
         <h3 style="color: #991b1b; margin-top: 0;">⚠️ Data Loading Failed</h3>
@@ -321,13 +555,23 @@ if unified_df is None:
         </ol>
     </div>
     """, unsafe_allow_html=True)
-    debug_log("⛔ App stopped: Could not load unified data")
+    debug_log("⛔ App stopped: Could not load catalog")
     st.stop()
 
 # ---------- SIDEBAR ----------
-st.sidebar.markdown('<div class="sidebar-heading">📂 Category Selection</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="sidebar-heading">⚙️ Performance</div>', unsafe_allow_html=True)
+default_unified_rows = int(os.environ.get("UNIFIED_SAMPLE_ROWS", "200000"))
+unified_sample_rows = st.sidebar.slider(
+    "Max rows to load (sample)",
+    min_value=50000,
+    max_value=500000,
+    value=max(50000, min(500000, default_unified_rows)),
+    step=50000,
+    help="Loads a capped sample from the large Parquet file to stay within EC2 memory limits.",
+)
 
-all_categories = sorted(unified_df["category"].unique())
+st.sidebar.markdown('<div class="sidebar-heading">📂 Category Selection</div>', unsafe_allow_html=True)
+all_categories = catalog.get("categories", [])
 selected_categories = st.sidebar.multiselect(
     "Select Categories",
     options=all_categories,
@@ -337,15 +581,37 @@ selected_categories = st.sidebar.multiselect(
 
 st.sidebar.markdown('<div class="sidebar-heading">🛒 Product Selection</div>', unsafe_allow_html=True)
 
-# Filter product list based on selected categories
+# Candidate products come from the lightweight catalog (bounded scan).
+product_query = st.sidebar.text_input(
+    "Search Products",
+    value="",
+    help="Type to filter the product list. This avoids loading all products into the widget.",
+)
+
 if selected_categories:
-    category_products = sorted(unified_df[unified_df["category"].isin(selected_categories)]["product_name"].unique())
+    candidate_products = []
+    products_by_category = catalog.get("products_by_category", {})
+    for cat in selected_categories:
+        candidate_products.extend(products_by_category.get(cat, []))
+    if not candidate_products:
+        candidate_products = catalog.get("top_products", [])
 else:
-    category_products = sorted(unified_df["product_name"].unique())
+    candidate_products = catalog.get("top_products", [])
+
+# De-dupe while preserving order
+candidate_products = list(dict.fromkeys([p for p in candidate_products if p is not None]))
+if product_query.strip():
+    q = product_query.strip().lower()
+    candidate_products = [p for p in candidate_products if q in str(p).lower()]
+
+MAX_PRODUCT_OPTIONS = 2000
+if len(candidate_products) > MAX_PRODUCT_OPTIONS:
+    st.sidebar.caption(f"Showing {MAX_PRODUCT_OPTIONS:,} products (refine search to narrow).")
+    candidate_products = candidate_products[:MAX_PRODUCT_OPTIONS]
 
 selected_products = st.sidebar.multiselect(
     "Select Products",
-    options=category_products,
+    options=candidate_products,
     default=[],
     help="Choose one or more products to compare platforms. Leave empty to use all products in selected categories.",
 )
@@ -369,8 +635,17 @@ st.sidebar.markdown(f"""
 | ⭐ Quality | **{w_quality}** | {w_quality/total_w*100:.0f}% |
 """)
 
-# ---------- FILTER DATA ----------
-filtered = unified_df.copy()
+# ---------- LOAD & FILTER DATA (SAMPLED) ----------
+cats_tuple = tuple(selected_categories) if selected_categories else None
+prods_tuple = tuple(selected_products) if selected_products else None
+with st.spinner("📥 Loading a data sample for analysis..."):
+    unified_df = load_unified_sample(cats_tuple, prods_tuple, max_rows=int(unified_sample_rows))
+
+if unified_df is None or unified_df.empty:
+    st.warning("No data could be loaded for the selected filters. Try broadening your selection or increasing the sample size.")
+    st.stop()
+
+filtered = unified_df
 if selected_categories:
     filtered = filtered[filtered["category"].isin(selected_categories)]
 if selected_products:
@@ -400,7 +675,7 @@ scores = compute_platform_scores(filtered, w_delivery, w_price, w_quality)
 # ---------- TOP METRICS ----------
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("📦 Products Matched", f"{filtered['product_name'].nunique()}")
-c2.metric("📄 Records Analysed", f"{len(filtered):,}")
+c2.metric("📄 Records (Sampled)", f"{len(filtered):,}")
 c3.metric("🏆 Top Platform", f"{PLATFORM_ICONS.get(scores.iloc[0]['platform'],'')} {scores.iloc[0]['platform'].title()}")
 c4.metric("🎯 Top Score", f"{scores.iloc[0]['overall_score']:.1f} / 100")
 
@@ -605,7 +880,7 @@ st.markdown(f"""
 st.markdown("---")
 st.markdown("### 🤖 Demand Forecasting — GBT Model")
 
-demand_df = load_demand_forecasts()
+demand_df = load_demand_forecasts(cats_tuple, prods_tuple, max_rows=80_000)
 if demand_df is not None:
     # Filter by selected categories and products
     if selected_categories:
@@ -725,7 +1000,7 @@ else:
 st.markdown("---")
 st.markdown("### 📈 Trend Analysis — Random Forest Classifier")
 
-trend_df = load_trend_labels()
+trend_df = load_trend_labels(cats_tuple, prods_tuple, max_rows=80_000)
 if trend_df is not None:
     # Filter by selected categories and products
     if selected_categories:

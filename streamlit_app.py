@@ -8,6 +8,7 @@ full sidebar, all charts) with EC2-safe optimisations:
   • Categorical dtypes cast to proper types before any arithmetic
   • Chart samples capped at 50 k rows
   • Graceful fallback to demo data when S3 is unavailable
+  • _resolve_s3_path probes both <name>.parquet/ and <name>/ folder variants
 """
 
 import os, sys
@@ -64,34 +65,32 @@ elif not os.environ.get("AWS_ACCESS_KEY_ID"):
     except Exception as e:
         dbg(f"⚠️  Secrets load failed: {e}")
 
-# ── Paths (same logic as original) ───────────────────────────────────────────
-if IS_STREAMLIT_CLOUD:
-    S3_BASE          = "s3://qcommerce-bdt-cct/parquets"
-    BASE_DIR         = S3_BASE
-    UNIFIED_PARQUET  = f"{S3_BASE}/unified.parquet"
-    PRICE_ANALYTICS  = f"{S3_BASE}/price_analytics.parquet"
-    DELIVERY_ANALYTICS = f"{S3_BASE}/delivery_analytics.parquet"
-    REVENUE_ANALYTICS  = f"{S3_BASE}/revenue_analytics.parquet"
-    STOCK_ANALYTICS    = f"{S3_BASE}/stock_analytics.parquet"
-    DEMAND_FORECASTS   = f"{S3_BASE}/demand_forecasts.parquet"
-    TREND_LABELS       = f"{S3_BASE}/trend_labels.parquet"
-elif IS_DATABRICKS:
-    PROCESSED_DIR    = "/Volumes/workspace/default/data/processed"
-    CURATED_DIR      = "/Volumes/workspace/default/data/curated"
-    UNIFIED_PARQUET  = os.path.join(PROCESSED_DIR, "unified.parquet")
-    PRICE_ANALYTICS  = os.path.join(PROCESSED_DIR, "price_analytics.parquet")
+# ── S3 base ───────────────────────────────────────────────────────────────────
+S3_BASE = "s3://qcommerce-bdt-cct/parquets"
+
+# ── Static paths for Databricks ───────────────────────────────────────────────
+if IS_DATABRICKS:
+    PROCESSED_DIR      = "/Volumes/workspace/default/data/processed"
+    CURATED_DIR        = "/Volumes/workspace/default/data/curated"
+    UNIFIED_PARQUET    = os.path.join(PROCESSED_DIR, "unified.parquet")
+    PRICE_ANALYTICS    = os.path.join(PROCESSED_DIR, "price_analytics.parquet")
     DELIVERY_ANALYTICS = os.path.join(PROCESSED_DIR, "delivery_analytics.parquet")
     REVENUE_ANALYTICS  = os.path.join(PROCESSED_DIR, "revenue_analytics.parquet")
     STOCK_ANALYTICS    = os.path.join(PROCESSED_DIR, "stock_analytics.parquet")
     DEMAND_FORECASTS   = os.path.join(CURATED_DIR,   "demand_forecasts.parquet")
     TREND_LABELS       = os.path.join(CURATED_DIR,   "trend_labels.parquet")
 else:
-    # EC2 / local — data sits next to this script
-    BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
-    S3_BASE          = "s3://qcommerce-bdt-cct/parquets"
-    UNIFIED_PARQUET  = f"{S3_BASE}/unified.parquet"
-    DEMAND_FORECASTS = f"{S3_BASE}/demand_forecasts.parquet"
-    TREND_LABELS     = f"{S3_BASE}/trend_labels.parquet"
+    # EC2 / local / Streamlit Cloud — all read from S3
+    # Static paths that are known to resolve:
+    UNIFIED_PARQUET    = f"{S3_BASE}/unified.parquet"
+    PRICE_ANALYTICS    = f"{S3_BASE}/price_analytics.parquet"
+    DELIVERY_ANALYTICS = f"{S3_BASE}/delivery_analytics.parquet"
+    REVENUE_ANALYTICS  = f"{S3_BASE}/revenue_analytics.parquet"
+    STOCK_ANALYTICS    = f"{S3_BASE}/stock_analytics.parquet"
+    # These two are resolved at runtime via _resolve_s3_path (set to None here,
+    # populated after pyarrow is confirmed available — see "Resolve paths" block)
+    DEMAND_FORECASTS   = None
+    TREND_LABELS       = None
 
 PLATFORM_COLORS = {"blinkit": "#F8C100", "zepto": "#7B2FF7", "swiggy": "#FC8019"}
 PLATFORM_ICONS  = {"blinkit": "🟡",      "zepto": "🟣",      "swiggy": "🟠"}
@@ -168,7 +167,7 @@ def _path_is_valid(path: str) -> bool:
     Uses pad.dataset(..., exclude_invalid_files=True) so _SUCCESS / metadata
     files are silently skipped.
     """
-    if pad is None:
+    if pad is None or not path:
         return False
     try:
         fs, bare = _pq_path(path)
@@ -179,6 +178,27 @@ def _path_is_valid(path: str) -> bool:
     except Exception as e:
         dbg(f"_path_is_valid({path}): {type(e).__name__}: {e}")
         return False
+
+
+def _resolve_s3_path(base: str, name: str) -> str:
+    """
+    Probe both <name>.parquet (Spark default folder name) and bare <name>.
+    Returns whichever has valid part-files, or the .parquet variant as
+    a safe default so error messages still point at a meaningful path.
+
+    This makes trend_labels and demand_forecasts resilient to whether the
+    Spark job wrote the folder as  trend_labels.parquet/  or  trend_labels/.
+    """
+    with_ext = f"{base}/{name}.parquet"
+    without  = f"{base}/{name}"
+    if _path_is_valid(with_ext):
+        dbg(f"✅ resolved {name} → {with_ext}")
+        return with_ext
+    if _path_is_valid(without):
+        dbg(f"✅ resolved {name} → {without}")
+        return without
+    dbg(f"⚠️  neither path valid for '{name}', defaulting to {with_ext}")
+    return with_ext
 
 
 def _cast_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -206,12 +226,9 @@ def _cast_df(df: pd.DataFrame) -> pd.DataFrame:
             continue
         if col in NUMERIC_COLS:
             if hasattr(df[col], "cat"):
-                # was incorrectly categorised — recover the underlying values
                 df[col] = df[col].astype(str).replace("nan", np.nan)
             df[col] = pd.to_numeric(df[col], errors="coerce")
         elif hasattr(df[col], "cat"):
-            # string categoricals: keep as category but ensure string categories
-            # (not numpy scalars) so .str accessor works
             df[col] = df[col].astype("category")
     return df
 
@@ -254,7 +271,6 @@ def _stream_parquet(
 
         for batch in scanner.to_batches():
             scanned += batch.num_rows
-            # strings_to_categorical saves memory; _cast_df fixes arithmetic types
             dfb = _cast_df(batch.to_pandas(strings_to_categorical=True))
 
             if cats_set  and "category"     in dfb.columns:
@@ -294,6 +310,17 @@ def _stream_parquet(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# RESOLVE DYNAMIC S3 PATHS  (done once after pyarrow is available)
+# ═════════════════════════════════════════════════════════════════════════════
+
+if not IS_DATABRICKS:
+    DEMAND_FORECASTS = _resolve_s3_path(S3_BASE, "demand_forecasts")
+    TREND_LABELS     = _resolve_s3_path(S3_BASE, "trend_labels")
+    dbg(f"DEMAND_FORECASTS → {DEMAND_FORECASTS}")
+    dbg(f"TREND_LABELS     → {TREND_LABELS}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # CATALOG  (lightweight sidebar lists — scans only 200 k rows)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -319,7 +346,6 @@ def build_catalog(scan_rows: int = 200_000) -> Optional[dict]:
             scanned += batch.num_rows
             dfb = _cast_df(batch.to_pandas(strings_to_categorical=True))
             dfb = dfb.dropna(subset=["category", "product_name"])
-            # convert categorical back to plain str for set operations
             dfb["category"]     = dfb["category"    ].astype(str)
             dfb["product_name"] = dfb["product_name"].astype(str)
             if dfb.empty:
@@ -434,7 +460,6 @@ def compute_platform_scores(df, w_delivery, w_price, w_quality):
         in_stock_pct  = ("in_stock",           "mean"),
     ).reset_index()
 
-    # ensure platform is a plain string (may be Categorical after groupby)
     agg["platform"] = agg["platform"].astype(str)
 
     def norm(s, invert=False):
@@ -559,10 +584,8 @@ if unified_df is None or unified_df.empty:
     st.error("No data loaded. Try broadening your filters or increasing the sample size.")
     st.stop()
 
-# ensure platform is plain string before filtering/groupby
 unified_df["platform"] = unified_df["platform"].astype(str)
 
-# apply sidebar filters
 filtered = unified_df.copy()
 if selected_categories:
     filtered = filtered[filtered["category"].astype(str).isin(selected_categories)]
@@ -573,7 +596,6 @@ if filtered.empty:
     st.warning("No rows match the current filters. Please broaden the selection.")
     st.stop()
 
-# sample for charts to avoid browser lag
 CHART_CAP = 50_000
 chart_df  = filtered.sample(n=CHART_CAP, random_state=42) if len(filtered) > CHART_CAP else filtered
 dbg(f"filtered={len(filtered):,}  chart_df={len(chart_df):,}")
@@ -711,7 +733,6 @@ cat_platform = chart_df.groupby(["category", "platform"]).agg(
     avg_delivery = ("delivery_minutes",  "mean"),
     avg_rating   = ("rating",            "mean"),
 ).reset_index()
-# ensure string dtype for plotly color map
 cat_platform["platform"] = cat_platform["platform"].astype(str)
 cat_platform["category"] = cat_platform["category"].astype(str)
 
@@ -791,7 +812,7 @@ st.markdown("### 🤖 Demand Forecasting — GBT Model")
 
 demand_df = None if USING_DEMO else load_demand_forecasts(cats_t, prods_t)
 
-if demand_df is not None:
+if demand_df is not None and not demand_df.empty:
     demand_df["platform"] = demand_df["platform"].astype(str)
 
     if selected_categories:
@@ -806,16 +827,13 @@ if demand_df is not None:
     if len(demand_filtered) > 50_000:
         demand_filtered = demand_filtered.sample(50_000, random_state=42)
 
-    # ── preference multiplier ─────────────────────────────────────────────
-    # scores["platform"] is already plain str (cast in compute_platform_scores)
     platform_scores_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
-    # map returns float64; predicted_demand is float64 thanks to _cast_df → safe to multiply
     demand_filtered = demand_filtered.copy()
     demand_filtered["preference_multiplier"] = (
         demand_filtered["platform"].map(platform_scores_map).fillna(0.5)
     )
     demand_filtered["adj_predicted_demand"] = (
-        demand_filtered["predicted_demand"].astype(float)      # explicit guard
+        demand_filtered["predicted_demand"].astype(float)
         * demand_filtered["preference_multiplier"].astype(float)
     )
 
@@ -892,7 +910,6 @@ if demand_df is not None:
             )
             st.plotly_chart(fig_d2, use_container_width=True)
 
-        # Heatmap
         cat_plat_demand = (
             demand_filtered.groupby(["category", "platform"])
             ["adj_predicted_demand"].mean().reset_index()
@@ -916,7 +933,13 @@ if demand_df is not None:
     else:
         st.info("No demand forecast data for selected products.")
 else:
-    st.warning("Demand forecast data not found. Run `ml_pipeline.py` to generate it.")
+    if USING_DEMO:
+        st.warning("Demand forecast data not available in demo mode.")
+    else:
+        st.warning(
+            f"Demand forecast data not found at `{DEMAND_FORECASTS}`. "
+            "Run `ml_pipeline.py` to generate it."
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -926,9 +949,10 @@ else:
 st.markdown("---")
 st.markdown("### 📈 Trend Analysis — Random Forest Classifier")
 
+# ── Load using the same _stream_parquet path machinery as unified ─────────────
 trend_df = None if USING_DEMO else load_trend_labels(cats_t, prods_t)
 
-if trend_df is not None:
+if trend_df is not None and not trend_df.empty:
     trend_df["platform"] = trend_df["platform"].astype(str)
 
     if selected_categories:
@@ -943,13 +967,11 @@ if trend_df is not None:
     if len(trend_filtered) > 50_000:
         trend_filtered = trend_filtered.sample(50_000, random_state=42)
 
-    # ── preference multiplier ─────────────────────────────────────────────
     platform_scores_map = dict(zip(scores["platform"], scores["overall_score"] / 100))
     trend_filtered = trend_filtered.copy()
     trend_filtered["preference_multiplier"] = (
         trend_filtered["platform"].map(platform_scores_map).fillna(0.5)
     )
-    # explicit .astype(float) guards against any residual categorical dtype
     trend_filtered["adj_daily_demand"] = (
         trend_filtered["daily_demand"].astype(float)
         * trend_filtered["preference_multiplier"].astype(float)
@@ -983,7 +1005,7 @@ if trend_df is not None:
 
         trend_filtered["predicted_trend"] = (
             trend_filtered["predicted_label_idx"]
-            .astype(float).round().astype("Int64")   # handles NaN safely
+            .astype(float).round().astype("Int64")
             .map(trend_label_map).fillna("unknown")
         )
 
@@ -1039,7 +1061,15 @@ if trend_df is not None:
     else:
         st.info("No trend data for selected products.")
 else:
-    st.warning("Trend labels data not found. Run `ml_pipeline.py` to generate it.")
+    if USING_DEMO:
+        st.warning("Trend analysis not available in demo mode.")
+    else:
+        st.warning(
+            f"Trend labels data not found at `{TREND_LABELS}`. "
+            "Run `ml_pipeline.py` to generate it, or check that the S3 folder "
+            "`trend_labels.parquet/` (or `trend_labels/`) exists under "
+            f"`{S3_BASE}/`."
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

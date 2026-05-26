@@ -18,6 +18,7 @@ import sys
 import s3fs
 from collections import Counter, defaultdict
 from typing import Optional, Sequence, Tuple
+import pyarrow.fs as pafs
 
 try:
     import pyarrow.parquet as pq
@@ -275,14 +276,14 @@ def load_trend_labels():
 @st.cache_resource
 def _s3_filesystem():
     # Reuse the same S3 client across reruns.
-    return s3fs.S3FileSystem(anon=False)
+    region = os.environ.get("AWS_DEFAULT_REGION") or None
+    return pafs.S3FileSystem(region=region)
 
 
-def _open_parquet(path: str):
+def _parquet_path(path: str):
     if path.startswith("s3://"):
-        # s3fs expects "bucket/key" (without the "s3://" prefix).
-        return _s3_filesystem().open(path.replace("s3://", "", 1), "rb")
-    return open(path, "rb")
+        return _s3_filesystem(), path.replace("s3://", "", 1)
+    return None, path
 
 
 def _ensure_pyarrow():
@@ -319,43 +320,43 @@ def _load_parquet_sample(
 
     chunks = []
     try:
-        with _open_parquet(path) as f:
-            pf = pq.ParquetFile(f)
-            for batch in pf.iter_batches(batch_size=batch_size, columns=list(columns), use_threads=True):
-                scanned_rows += batch.num_rows
-                dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
+        filesystem, parquet_path = _parquet_path(path)
+        pf = pq.ParquetFile(parquet_path, filesystem=filesystem)
+        for batch in pf.iter_batches(batch_size=batch_size, columns=list(columns), use_threads=True):
+            scanned_rows += batch.num_rows
+            dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
 
-                if categories_set and "category" in dfb.columns:
-                    dfb = dfb[dfb["category"].isin(categories_set)]
-                if products_set and "product_name" in dfb.columns:
-                    dfb = dfb[dfb["product_name"].isin(products_set)]
+            if categories_set and "category" in dfb.columns:
+                dfb = dfb[dfb["category"].isin(categories_set)]
+            if products_set and "product_name" in dfb.columns:
+                dfb = dfb[dfb["product_name"].isin(products_set)]
 
-                if dfb.empty:
-                    if scanned_rows >= scan_row_budget:
-                        break
-                    continue
-
-                remaining = max_rows - rows_collected
-                if remaining <= 0:
+            if dfb.empty:
+                if scanned_rows >= scan_row_budget:
                     break
+                continue
 
-                # Broad scan: take a small number of rows per batch to keep sampling spread out.
-                if not categories_set and not products_set:
-                    per_batch_cap = max(2_000, max_rows // 50)
-                    take_n = min(len(dfb), per_batch_cap, remaining)
-                else:
-                    take_n = min(len(dfb), remaining)
+            remaining = max_rows - rows_collected
+            if remaining <= 0:
+                break
 
-                if take_n < len(dfb):
-                    dfb = dfb.sample(n=take_n, random_state=int(rng.integers(0, 2**31 - 1)), ignore_index=True)
-                else:
-                    dfb = dfb.reset_index(drop=True)
+            # Broad scan: take a small number of rows per batch to keep sampling spread out.
+            if not categories_set and not products_set:
+                per_batch_cap = max(2_000, max_rows // 50)
+                take_n = min(len(dfb), per_batch_cap, remaining)
+            else:
+                take_n = min(len(dfb), remaining)
 
-                chunks.append(dfb)
-                rows_collected += len(dfb)
+            if take_n < len(dfb):
+                dfb = dfb.sample(n=take_n, random_state=int(rng.integers(0, 2**31 - 1)), ignore_index=True)
+            else:
+                dfb = dfb.reset_index(drop=True)
 
-                if rows_collected >= max_rows or scanned_rows >= scan_row_budget:
-                    break
+            chunks.append(dfb)
+            rows_collected += len(dfb)
+
+            if rows_collected >= max_rows or scanned_rows >= scan_row_budget:
+                break
 
         if not chunks:
             return pd.DataFrame(columns=list(columns))
@@ -389,39 +390,39 @@ def load_unified_catalog(scan_rows: int = 400_000, max_products_total: int = 500
     scanned = 0
 
     try:
-        with _open_parquet(UNIFIED_PARQUET) as f:
-            pf = pq.ParquetFile(f)
-            for batch in pf.iter_batches(batch_size=65536, columns=columns, use_threads=True):
-                scanned += batch.num_rows
-                dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
-                dfb = dfb.dropna(subset=["category", "product_name"])
-                if dfb.empty:
-                    if scanned >= scan_rows:
-                        break
-                    continue
-
-                categories.update(dfb["category"].unique().tolist())
-
-                # Prefer units_ordered as a proxy for "popular products", fallback to frequency.
-                if "units_ordered" in dfb.columns and pd.api.types.is_numeric_dtype(dfb["units_ordered"]):
-                    prod_sum = dfb.groupby("product_name")["units_ordered"].sum()
-                    for k, v in prod_sum.items():
-                        product_counts[k] += float(v)
-
-                    cat_prod_sum = dfb.groupby(["category", "product_name"])["units_ordered"].sum()
-                    for (cat, prod), v in cat_prod_sum.items():
-                        per_cat_counts[cat][prod] += float(v)
-                else:
-                    vc = dfb["product_name"].value_counts()
-                    for k, v in vc.items():
-                        product_counts[k] += int(v)
-                    for cat, sub in dfb.groupby("category"):
-                        vc2 = sub["product_name"].value_counts()
-                        for k, v in vc2.items():
-                            per_cat_counts[cat][k] += int(v)
-
+        filesystem, parquet_path = _parquet_path(UNIFIED_PARQUET)
+        pf = pq.ParquetFile(parquet_path, filesystem=filesystem)
+        for batch in pf.iter_batches(batch_size=65536, columns=columns, use_threads=True):
+            scanned += batch.num_rows
+            dfb = batch.to_pandas(strings_to_categorical=True, use_threads=True)
+            dfb = dfb.dropna(subset=["category", "product_name"])
+            if dfb.empty:
                 if scanned >= scan_rows:
                     break
+                continue
+
+            categories.update(dfb["category"].unique().tolist())
+
+            # Prefer units_ordered as a proxy for "popular products", fallback to frequency.
+            if "units_ordered" in dfb.columns and pd.api.types.is_numeric_dtype(dfb["units_ordered"]):
+                prod_sum = dfb.groupby("product_name")["units_ordered"].sum()
+                for k, v in prod_sum.items():
+                    product_counts[k] += float(v)
+
+                cat_prod_sum = dfb.groupby(["category", "product_name"])["units_ordered"].sum()
+                for (cat, prod), v in cat_prod_sum.items():
+                    per_cat_counts[cat][prod] += float(v)
+            else:
+                vc = dfb["product_name"].value_counts()
+                for k, v in vc.items():
+                    product_counts[k] += int(v)
+                for cat, sub in dfb.groupby("category"):
+                    vc2 = sub["product_name"].value_counts()
+                    for k, v in vc2.items():
+                        per_cat_counts[cat][k] += int(v)
+
+            if scanned >= scan_rows:
+                break
 
         cat_list = sorted([c for c in categories if c is not None])
         top_products = [p for p, _ in product_counts.most_common(max_products_total)]

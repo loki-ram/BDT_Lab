@@ -2,7 +2,7 @@
 streamlit_app.py — QuickCommerce Platform Recommender Dashboard
 
 Combines the original dashboard structure (local / Databricks / S3 paths,
-full sidebar, all charts) with EC2-safe optimisations:
+full sidebar, all charts) with Streamlit-safe optimisations:
   • pyarrow.dataset reads Spark-partitioned folders (part-*.snappy.parquet)
   • Streaming with hard row-cap so 740 MB never lands in RAM
   • Categorical dtypes cast to proper types before any arithmetic
@@ -43,27 +43,24 @@ def dbg(msg: str):
 dbg("🚀 App init")
 
 # ── Environment detection ─────────────────────────────────────────────────────
-IS_DATABRICKS      = "DATABRICKS_RUNTIME_VERSION" in os.environ
-IS_STREAMLIT_CLOUD = (
-    os.environ.get("STREAMLIT_RUNTIME_VERSION") is not None
-    or os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
-)
+IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
 
-# ── AWS credentials ───────────────────────────────────────────────────────────
-if IS_STREAMLIT_CLOUD:
+# ── AWS credentials (Streamlit Cloud only) ───────────────────────────────────
+def _load_aws_creds() -> None:
     try:
         os.environ["AWS_ACCESS_KEY_ID"]     = st.secrets["AWS_ACCESS_KEY_ID"]
         os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
-        os.environ["AWS_DEFAULT_REGION"]    = "eu-north-1"
-    except Exception:
-        pass
-elif not os.environ.get("AWS_ACCESS_KEY_ID"):
-    try:
-        os.environ["AWS_ACCESS_KEY_ID"]     = st.secrets.get("AWS_ACCESS_KEY_ID", "")
-        os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets.get("AWS_SECRET_ACCESS_KEY", "")
-        dbg("✅ AWS creds loaded from secrets")
+        os.environ["AWS_DEFAULT_REGION"]    = st.secrets.get("AWS_DEFAULT_REGION", "eu-north-1")
+        dbg("✅ AWS creds loaded from Streamlit secrets")
     except Exception as e:
+        st.error(
+            "AWS credentials are missing. Add AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY to Streamlit secrets."
+        )
         dbg(f"⚠️  Secrets load failed: {e}")
+        st.stop()
+
+_load_aws_creds()
 
 # ── S3 base ───────────────────────────────────────────────────────────────────
 S3_BASE = "s3://qcommerce-bdt-cct/parquets"
@@ -80,7 +77,7 @@ if IS_DATABRICKS:
     DEMAND_FORECASTS   = os.path.join(CURATED_DIR,   "demand_forecasts.parquet")
     TREND_LABELS       = os.path.join(CURATED_DIR,   "trend_labels.parquet")
 else:
-    # EC2 / local / Streamlit Cloud — all read from S3
+    # Streamlit Cloud / local — all read from S3
     # Static paths that are known to resolve:
     UNIFIED_PARQUET    = f"{S3_BASE}/unified.parquet"
     PRICE_ANALYTICS    = f"{S3_BASE}/price_analytics.parquet"
@@ -523,7 +520,7 @@ default_rows = int(os.environ.get("UNIFIED_SAMPLE_ROWS", "150000"))
 sample_rows  = st.sidebar.slider(
     "Max rows to sample", 50_000, 400_000,
     value=max(50_000, min(400_000, default_rows)), step=50_000,
-    help="Cap on rows read from S3. Lower = faster & less RAM on EC2.",
+    help="Cap on rows read from S3. Lower = faster & less RAM on Streamlit Cloud.",
 )
 
 st.sidebar.markdown('<div class="sidebar-heading">📂 Category Selection</div>', unsafe_allow_html=True)
